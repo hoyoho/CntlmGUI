@@ -115,3 +115,7 @@ msiexec /x build\CntlmGui.msi REMOVECNTLM=1 /qn
 
 **密码怎么存的？**
 只以 DPAPI 密文写入 `settings.json`，仅当前 Windows 用户可解密。如果选择回退到明文 `Password`，明文会出现在生成的 `cntlm.ini` 中，建议始终使用哈希或 SSPI。
+
+## 致谢
+
+- 应用图标来自 [Icons8](https://icons8.com)。源图见 `assets/app-icon.png`。
