@@ -1,9 +1,10 @@
 using System.Drawing;
-using System.Drawing.Drawing2D;
+using System.Windows.Forms;
 
 namespace CntlmGUI;
 
-internal static class AppTheme
+/// <summary>全应用统一视觉规范：字体、配色、控件尺寸。</summary>
+public static class AppTheme
 {
     public static readonly Font Ui = new("Microsoft YaHei UI", 9F);
     public static readonly Font UiBold = new("Microsoft YaHei UI", 9F, FontStyle.Bold);
@@ -22,61 +23,16 @@ internal static class AppTheme
 
     public const int LabelCol = 165;
 
-    public static Button CreateButton(string text, bool primary = false)
+    public static void StyleButton(Button b, bool primary = false)
     {
-        var button = new Button
-        {
-            Text = text,
-            Font = Ui,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            MinimumSize = new Size(0, 34),
-            Padding = new Padding(16, 0, 16, 0),
-            FlatStyle = FlatStyle.Flat,
-            BackColor = primary ? Accent : Color.White,
-            ForeColor = primary ? Color.White : Accent,
-            Cursor = Cursors.Hand,
-            UseVisualStyleBackColor = false,
-            TabStop = true,
-        };
-        button.FlatAppearance.BorderColor = Accent;
-        button.FlatAppearance.BorderSize = 1;
-        return button;
-    }
-
-    public static Button CreateSmallButton(string text)
-    {
-        var button = new Button
-        {
-            Text = text,
-            Font = UiSmall,
-            AutoSize = false,
-            Size = new Size(58, 26),
-            FlatStyle = FlatStyle.Flat,
-            BackColor = Color.White,
-            ForeColor = Accent,
-            Cursor = Cursors.Hand,
-            UseVisualStyleBackColor = false,
-        };
-        button.FlatAppearance.BorderColor = Accent;
-        button.FlatAppearance.BorderSize = 1;
-        return button;
-    }
-
-    public static GraphicsPath RoundedRect(Rectangle bounds, int radius)
-    {
-        var path = new GraphicsPath();
-        int d = radius * 2;
-        if (d <= 0)
-        {
-            path.AddRectangle(bounds);
-            return path;
-        }
-        path.AddArc(bounds.Left, bounds.Top, d, d, 180, 90);
-        path.AddArc(bounds.Right - d, bounds.Top, d, d, 270, 90);
-        path.AddArc(bounds.Right - d, bounds.Bottom - d, d, d, 0, 90);
-        path.AddArc(bounds.Left, bounds.Bottom - d, d, d, 90, 90);
-        path.CloseFigure();
-        return path;
+        b.FlatStyle = FlatStyle.Flat;
+        b.BackColor = primary ? Accent : Color.White;
+        b.ForeColor = primary ? Color.White : AccentDark;
+        b.FlatAppearance.BorderColor = Accent;
+        b.FlatAppearance.BorderSize = 1;
+        b.Height = 34;
+        b.Padding = new Padding(16, 2, 16, 2);
+        b.Font = Ui;
+        b.Cursor = Cursors.Hand;
     }
 }

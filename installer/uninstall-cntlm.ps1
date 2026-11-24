@@ -1,152 +1,81 @@
-﻿[CmdletBinding()]
+﻿# CntlmGui 卸载伴随清理：
+# - 升级时本脚本不会执行（MSI 条件里有 NOT UPGRADINGPRODUCTCODE）；
+# - 主动卸载时由 MSI 传入 -Ask -UILevel [UILevel]，
+#   交互式卸载弹窗询问是否同时卸载 cntlm，默认“否”；
+# - 静默卸载默认保留 cntlm，可显式传 REMOVECNTLM=1 强制卸载；
+# - 若选择卸载，则仅按 DisplayName 含 "cntlm" 的程序调用其自身卸载器，避免误伤其他软件。
 param(
-    [switch]$Ask,
-    [int]$UILevel = 5,
-    [string]$RemoveCntlm = ""
+  [switch]$Ask,
+  [int]$UILevel = 5,
+  [string]$RemoveCntlm = ""
 )
 
 $ErrorActionPreference = "SilentlyContinue"
 
-function Write-Step([string]$Message) {
-    Write-Host "[CntlmGUI] $Message"
-}
-
-function Test-Truthy([string]$Value) {
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
-    return @("1", "yes", "true", "y") -contains $Value.Trim().ToLowerInvariant()
-}
-
-function Get-CntlmUninstallEntries {
-    $roots = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
-        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-    )
-
-    $result = @()
-    foreach ($root in $roots) {
-        if (-not (Test-Path $root)) { continue }
-        foreach ($item in Get-ChildItem -Path $root -ErrorAction SilentlyContinue) {
-            $props = Get-ItemProperty -Path $item.PSPath -ErrorAction SilentlyContinue
-            if ($null -eq $props) { continue }
-
-            $displayName = [string]$props.DisplayName
-            if ([string]::IsNullOrWhiteSpace($displayName)) { continue }
-            if ($displayName -notmatch "cntlm") { continue }
-            if ($displayName -match "CntlmGUI") { continue }
-
-            $command = [string]$props.QuietUninstallString
-            if ([string]::IsNullOrWhiteSpace($command)) { $command = [string]$props.UninstallString }
-            if ([string]::IsNullOrWhiteSpace($command)) { continue }
-
-            $result += [pscustomobject]@{
-                DisplayName     = $displayName
-                Command         = $command.Trim()
-                InstallLocation = [string]$props.InstallLocation
-            }
-        }
-    }
-
-    return $result
-}
-
-function Split-UninstallCommand([string]$Command) {
-    if ([string]::IsNullOrWhiteSpace($Command)) { return $null }
-
-    $exe = ""
-    $tail = ""
-    $command = $Command.Trim()
-
-    if ($command.StartsWith('"')) {
-        $end = $command.IndexOf('"', 1)
-        if ($end -gt 0) {
-            $exe = $command.Substring(1, $end - 1)
-            if ($end + 1 -lt $command.Length) { $tail = $command.Substring($end + 1).Trim() }
-        }
-    }
-    elseif ($command -match '^(?<exe>.+?\.exe)\b(?<tail>.*)$') {
-        $exe = $matches['exe'].Trim()
-        $tail = $matches['tail'].Trim()
-    }
-    else {
-        $parts = $command -split '\s+', 2
-        $exe = $parts[0]
-        if ($parts.Count -gt 1) { $tail = $parts[1] }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($exe)) { return $null }
-    return [pscustomobject]@{ Exe = $exe; Tail = $tail }
-}
-
-function Stop-CntlmProcesses([string]$InstallLocation) {
-    if ([string]::IsNullOrWhiteSpace($InstallLocation)) { return }
-    $root = $InstallLocation.Trim().TrimEnd('\')
-    if ($root.Length -eq 0) { return }
-
-    $processes = Get-CimInstance Win32_Process -Filter "Name = 'cntlm.exe'"
-    foreach ($process in $processes) {
-        $path = [string]$process.ExecutablePath
-        if ([string]::IsNullOrWhiteSpace($path)) { continue }
-        if (-not $path.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
-
-        $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.ParentProcessId)"
-        if ($parent -and [string]$parent.Name -match "cygrunsrv") {
-            Write-Step "cntlm 由 cygrunsrv 托管，交给卸载器停止。"
-            continue
-        }
-
-        Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
-        Write-Step "已结束 cntlm 进程 $($process.ProcessId)。"
-    }
-}
-
-function Invoke-CntlmUninstaller([string]$Command) {
-    $target = Split-UninstallCommand -Command $Command
-    if ($null -eq $target) { return }
-
-    $name = [System.IO.Path]::GetFileName($target.Exe).ToLowerInvariant()
-    if ($name -eq "msiexec.exe") {
-        $arguments = ($target.Tail + " /qn /norestart").Trim()
-    }
-    else {
-        $arguments = ($target.Tail + " /VERYSILENT /SUPPRESSMSGBOXES /NORESTART").Trim()
-    }
-
-    Write-Step "正在卸载 cntlm：$($target.Exe) $arguments"
-    Start-Process -FilePath $target.Exe -ArgumentList $arguments -Wait -NoNewWindow
-}
-
-$entries = @(Get-CntlmUninstallEntries)
-if ($entries.Count -eq 0) {
-    Write-Step "未检测到 cntlm 安装，跳过。"
-    exit 0
-}
-
-$shouldRemove = $false
-if (Test-Truthy -Value $RemoveCntlm) {
-    $shouldRemove = $true
-}
-elseif ($Ask -and $UILevel -ge 5) {
+$doRemove = $false
+if ($RemoveCntlm -eq "1") {
+  $doRemove = $true
+} elseif ($Ask -and $UILevel -ge 5) {
+  try {
     Add-Type -AssemblyName System.Windows.Forms
-    $names = ($entries | ForEach-Object { $_.DisplayName }) -join "、"
-    $answer = [System.Windows.Forms.MessageBox]::Show(
-        "检测到已安装的 cntlm：$names`n`n是否同时卸载 cntlm？",
-        "卸载 CntlmGUI",
-        [System.Windows.Forms.MessageBoxButtons]::YesNo,
-        [System.Windows.Forms.MessageBoxIcon]::Question,
-        [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
-    $shouldRemove = ($answer -eq [System.Windows.Forms.DialogResult]::Yes)
+    $r = [System.Windows.Forms.MessageBox]::Show(
+      "是否同时卸载 cntlm？`n`n选择 '否' 将保留 cntlm，之后可单独卸载。",
+      "卸载 CntlmGui",
+      [System.Windows.Forms.MessageBoxButtons]::YesNo,
+      [System.Windows.Forms.MessageBoxIcon]::Question,
+      [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+    $doRemove = ($r -eq [System.Windows.Forms.DialogResult]::Yes)
+  } catch {
+    $doRemove = $false
+  }
 }
+if (-not $doRemove) { exit 0 }
 
-if (-not $shouldRemove) {
-    Write-Step "已保留 cntlm。"
-    exit 0
+$roots = @(
+  "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+  "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+)
+
+foreach ($root in $roots) {
+  foreach ($key in (Get-ChildItem $root)) {
+    $props = Get-ItemProperty -LiteralPath $key.PSPath
+    $display = "$($props.DisplayName)"
+    $uninstall = "$($props.UninstallString)"
+
+    # 只认 DisplayName，且必须是 cntlm/cntl，避免把 unins000.exe 等误判为别家
+    if ($display -notmatch "(?i)cntlm") { continue }
+
+    # 按路径结束该包安装目录下运行中的 cntlm 进程，避免 Inno 卸载器删不掉在用文件。
+    # 仅匹配 InstallLocation 前缀，不误杀用户手动运行的绿色版；
+    # cygrunsrv 服务的子进程留给卸载器 --stop 优雅停止，避免服务"意外终止"日志。
+    $loc = "$($props.InstallLocation)"
+    if ($loc -and (Test-Path -LiteralPath $loc)) {
+      $prefix = $loc.TrimEnd('\') + '\'
+      foreach ($proc in (Get-Process -Name "cntlm" -ErrorAction SilentlyContinue)) {
+        try {
+          $path = $proc.Path
+          if (-not $path -or -not $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
+          $parentName = ""
+          $parent = (Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction SilentlyContinue).ParentProcessId
+          if ($parent) {
+            try { $parentName = (Get-Process -Id $parent -ErrorAction Stop).ProcessName } catch { }
+          }
+          if ($parentName -ne "cygrunsrv") {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          }
+        } catch { }
+      }
+    }
+
+    $exe = $null
+    if ($uninstall -match '^\s*"([^"]+)"') {
+      $exe = $matches[1]
+    } elseif ($uninstall.Trim() -ne "") {
+      $exe = ($uninstall.Trim() -replace '^["'']', '') -split '\s+' | Select-Object -First 1
+    }
+    if ($exe -and (Test-Path -LiteralPath $exe)) {
+      Start-Process -FilePath $exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+    }
+  }
 }
-
-foreach ($entry in $entries) {
-    Stop-CntlmProcesses -InstallLocation $entry.InstallLocation
-    Invoke-CntlmUninstaller -Command $entry.Command
-}
-
-Write-Step "cntlm 卸载完成。"
-exit 0

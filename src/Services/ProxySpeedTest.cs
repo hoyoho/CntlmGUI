@@ -1,149 +1,176 @@
+using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using CntlmGUI.Models;
 
 namespace CntlmGUI.Services;
 
 /// <summary>
-/// 顺序测试上游代理：TCP 延迟 → 整链 HTTP → 吞吐。
+/// 对每个候选父代理（Proxy 列表中的一行）做对比测速：
+/// 1) 与代理主机直连的 TCP 延迟；2) 临时拉起独立 cntlm 进程，
+/// 用真实账号/哈希经该代理实际加载“待访问地址”并计时（整链测速）；
+/// 3) 可选：经同一实例下载一段固定大小的数据，测持续吞吐。
+///
+/// 约束：
+/// - 顺序执行，避免多个代理互相干扰；
+/// - 吞吐测试用 Range 限制大小，下满大小或到达时限即停止，按已下载字节计算速度；
+/// - 下载数据只读入内存缓冲并丢弃，不写磁盘；临时 ini/trace 在结束时删除。
 /// </summary>
 public sealed class ProxySpeedTest
 {
-    private const int RelayTimeoutSeconds = 12;
-    private const int TcpTimeoutMs = 3000;
+    private const int RelayTimeoutMs = 12_000;
+    private const int TcpTimeoutMs = 3_000;
+    private const int ReadyTimeoutMs = 300;
+    private const int ReadyAttempts = 40;
+    private const int ReadyPollMs = 150;
 
-    private readonly GuiSettings _settings;
-    private readonly string _url;
-    private readonly long _maxBytes;
-    private readonly int _speedTimeoutSec;
+    private readonly GuiSettings _s;
+    private readonly string _workDir = Path.Combine(GuiSettings.AppDataDir, "bench");
     private readonly string _exe;
 
-    public ProxySpeedTest(GuiSettings settings, string url, long maxBytes, int timeoutSec)
+    public ProxySpeedTest(GuiSettings s)
     {
-        _settings = settings;
-        _url = NormalizeUrl(url);
-        _maxBytes = Math.Max(0, maxBytes);
-        _speedTimeoutSec = Math.Max(1, timeoutSec);
-        _exe = settings.EffectiveBaseCntlmPath();
+        _s = s;
+        Directory.CreateDirectory(_workDir);
+        _exe = s.EffectiveBaseCntlmPath() ?? "";
+        CleanupOldBenchFiles();
     }
 
+    public bool Ready => File.Exists(_exe);
+
+    // ---------------- 入口 ----------------
+
+    /// <summary>URL 缺协议时自动补 https://，避免 HttpClient 因无 scheme 直接抛异常。</summary>
     public static string NormalizeUrl(string url)
     {
-        if (string.IsNullOrWhiteSpace(url)) return "";
-        var text = url.Trim();
-        if (!text.Contains("://", StringComparison.Ordinal)) text = "https://" + text;
-        return text;
+        var t = (url ?? "").Trim();
+        if (t.Length == 0) return t;
+        return t.IndexOf("://", StringComparison.Ordinal) >= 0 ? t : "https://" + t;
     }
 
-    public async Task RunAsync(IProgress<ProxyBench> progress, CancellationToken cancellationToken)
+    /// <summary>
+    /// 顺序测速：逐个代理执行，每完成一条通过 progress 回报完整结果。
+    /// probeUrl 非空时追加吞吐测试。
+    /// </summary>
+    public async Task<List<ProxyBench>> BenchAsync(string targetUrl, string? probeUrl,
+        long maxBytes, int timeoutSec, IProgress<ProxyBench>? progress = null, CancellationToken ct = default)
     {
-        var benchDir = Path.Combine(GuiSettings.ConfigDir, "bench");
-        CleanupOldFiles(benchDir);
+        targetUrl = NormalizeUrl(targetUrl);
+        probeUrl = string.IsNullOrWhiteSpace(probeUrl) ? null : NormalizeUrl(probeUrl);
 
-        foreach (var line in TextLines.Split(_settings.ProxyList))
+        var list = ParseCandidates();
+        if (list.Count == 0) return new List<ProxyBench>();
+
+        var results = new List<ProxyBench>(list.Count);
+        foreach (var (host, port) in list)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var result = await TestOneAsync(line, progress, cancellationToken).ConfigureAwait(false);
-            progress.Report(result);
+            ct.ThrowIfCancellationRequested();
+            var r = await BenchOneAsync(host, port, targetUrl, probeUrl, maxBytes, timeoutSec, ct)
+                .ConfigureAwait(false);
+            results.Add(r);
+            progress?.Report(r);
         }
+        return results;
     }
 
-    private async Task<ProxyBench> TestOneAsync(string line, IProgress<ProxyBench> progress,
-        CancellationToken cancellationToken)
+    /// <summary>从 ProxyList（每行 ip:port）解析候选代理。</summary>
+    private List<(string host, int port)> ParseCandidates() =>
+        TextLines.Split(_s.ProxyList)
+            .Select(ParseHostPort)
+            .Where(x => x != null)
+            .Select(x => x!.Value)
+            .ToList();
+
+    private static (string host, int port)? ParseHostPort(string line)
     {
-        var bench = new ProxyBench { Line = line };
+        int idx = line.LastIndexOf(':');
+        if (idx <= 0) return null;
+        var host = line[..idx].Trim();
+        var portText = line[(idx + 1)..].Trim();
+        if (host.Length == 0 || !int.TryParse(portText, out var port) || port is <= 0 or > 65535) return null;
+        return (host, port);
+    }
 
-        var target = ParseProxy(line);
-        if (target == null)
-        {
-            bench.TcpMs = -1;
-            bench.Detail = "代理格式无效";
-            return bench;
-        }
+    private async Task<ProxyBench> BenchOneAsync(string host, int port, string target,
+        string? probeUrl, long maxBytes, int timeoutSec, CancellationToken ct)
+    {
+        var line = $"{host}:{port}";
+        var tcpMs = await MeasureTcpAsync(host, port, ct);
+        if (tcpMs < 0)
+            return new ProxyBench(line) { Detail = "TCP 不可达" };
 
-        var (host, port) = target.Value;
-        bench.TcpMs = await TcpLatencyAsync(host, port, cancellationToken).ConfigureAwait(false);
-        if (bench.TcpMs < 0)
-        {
-            bench.Detail = "TCP 不可达";
-            return bench;
-        }
-
-        if (string.IsNullOrWhiteSpace(_exe) || !File.Exists(_exe))
-        {
-            bench.RelayMs = -1;
-            bench.Detail = "未找到 cntlm.exe";
-            return bench;
-        }
-
-        var benchDir = Path.Combine(GuiSettings.ConfigDir, "bench");
-        Directory.CreateDirectory(benchDir);
-
-        var localPort = GetFreePort();
-        var iniPath = Path.Combine(benchDir, $"bench-{localPort}.ini");
-        var logPath = Path.Combine(benchDir, $"bench-{localPort}.log");
-        Process? process = null;
-
+        var listen = AllocLocalPort();
+        var ini = Path.Combine(_workDir, $"bench-{listen}.ini");
+        var trace = Path.Combine(_workDir, $"bench-{listen}.log");
+        Process? proc = null;
         try
         {
-            File.WriteAllText(iniPath, BuildBenchConfig(line, localPort), new UTF8Encoding(false));
-
-            var psi = new ProcessStartInfo(_exe, $"-T \"{logPath}\" -f -c \"{iniPath}\"")
+            // 只保留该候选代理 + 本机临时监听端口的配置（认证方式与主配置保持一致）
+            var tmp = new GuiSettings
             {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                WorkingDirectory = Path.GetDirectoryName(_exe) ?? AppContext.BaseDirectory,
-            };
-
-            process = new Process { StartInfo = psi };
-            process.OutputDataReceived += (_, _) => { };
-            process.ErrorDataReceived += (_, _) => { };
-            process.Start();
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-
-            var ready = false;
-            for (var i = 0; i < 40; i++)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (process.HasExited) break;
-                if (Probe(localPort))
-                {
-                    ready = true;
-                    break;
-                }
-                await Task.Delay(150, cancellationToken).ConfigureAwait(false);
-            }
-
-            if (!ready)
-            {
-                bench.RelayMs = -1;
-                bench.Detail = process.HasExited ? "临时 cntlm 实例启动失败" : "临时 cntlm 实例未监听端口";
-                return bench;
-            }
-
-            using var handler = new HttpClientHandler
-            {
-                Proxy = new WebProxy($"http://127.0.0.1:{localPort}"),
+                Username = _s.Username,
+                Domain = _s.Domain,
+                Workstation = _s.Workstation,
+                Password = _s.Password,
+                PassLM = _s.PassLM,
+                PassNT = _s.PassNT,
+                PassNTLMv2 = _s.PassNTLMv2,
+                Auth = _s.Auth,
+                Flags = _s.Flags,
+                UseSspi = _s.UseSspi,
+                SspiType = _s.SspiType,
+                ProxyList = $"{host}:{port}",
                 UseProxy = true,
-                AllowAutoRedirect = true,
+                Listen = $"127.0.0.1:{listen}",
+                NoProxyList = "",
             };
-            using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+            File.WriteAllText(ini, CntlmConfigGenerator.Generate(tmp), new UTF8Encoding(false));
 
-            var relayOk = await RelayTestAsync(client, bench, cancellationToken).ConfigureAwait(false);
-            progress.Report(Clone(bench));
+            proc = StartCntlm(ini, trace);
+            if (proc == null)
+                return new ProxyBench(line) { TcpMs = tcpMs, Detail = "无法启动 cntlm 测试进程" };
 
-            if (relayOk && _url.Length > 0 && _maxBytes > 0)
+            var readyErr = await WaitReadyAsync(proc, listen, ct);
+            if (readyErr != null)
+                return new ProxyBench(line) { TcpMs = tcpMs, Detail = readyErr };
+
+            // 1) 整链：加载目标地址（只读到响应头）
+            var (ok, ms, status, err) = await RelayOnceAsync(listen, target, ct);
+            if (!ok)
+                return new ProxyBench(line) { TcpMs = tcpMs, Detail = err };
+
+            var result = new ProxyBench(line)
             {
-                await SpeedTestAsync(client, bench, cancellationToken).ConfigureAwait(false);
-            }
+                TcpMs = tcpMs,
+                RelayMs = ms,
+                HttpStatus = status,
+                Detail = $"HTTP {status}",
+            };
 
-            return bench;
+            // 2) 吞吐：同一 cntlm 实例，Range 限大小
+            if (probeUrl != null && maxBytes > 0)
+            {
+                var (speedOk, bps, bytes, speedMs, speedErr) =
+                    await ThroughputOnceAsync(listen, probeUrl, maxBytes, timeoutSec, ct);
+                result = result with
+                {
+                    SpeedBps = bps,
+                    SpeedBytes = bytes,
+                    SpeedMs = speedMs,
+                    SpeedOk = speedOk,
+                    SpeedDetail = speedErr,
+                };
+            }
+            return result;
         }
         catch (OperationCanceledException)
         {
@@ -151,269 +178,66 @@ public sealed class ProxySpeedTest
         }
         catch (Exception ex)
         {
-            bench.RelayMs = -1;
-            if (string.IsNullOrWhiteSpace(bench.Detail)) bench.Detail = ex.Message;
-            return bench;
+            return new ProxyBench(line) { TcpMs = tcpMs, Detail = Short((ex.InnerException ?? ex).Message) };
         }
         finally
         {
-            if (process != null)
+            if (proc != null)
             {
-                try
-                {
-                    if (!process.HasExited) process.Kill(true);
-                }
-                catch
-                {
-                    // 忽略
-                }
-                try
-                {
-                    process.Dispose();
-                }
-                catch
-                {
-                    // 忽略
-                }
+                try { if (!proc.HasExited) proc.Kill(entireProcessTree: true); } catch { }
+                proc.Dispose();
             }
-
-            TryDelete(iniPath);
-            TryDelete(logPath);
+            // 不留任何测试残留：ini 与 trace 都删除
+            try { if (File.Exists(ini)) File.Delete(ini); } catch { }
+            try { if (File.Exists(trace)) File.Delete(trace); } catch { }
         }
     }
 
-    private async Task<bool> RelayTestAsync(HttpClient client, ProxyBench bench, CancellationToken cancellationToken)
+    private Process? StartCntlm(string ini, string trace)
     {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(RelayTimeoutSeconds));
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, cancellationToken);
+        var psi = new ProcessStartInfo
+        {
+            FileName = _exe,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            WorkingDirectory = Path.GetDirectoryName(_exe),
+        };
+        psi.ArgumentList.Add("-T");
+        psi.ArgumentList.Add(trace);
+        psi.ArgumentList.Add("-f");
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add(ini);
+        return Process.Start(psi);
+    }
+
+    private static async Task<string?> WaitReadyAsync(Process proc, int listen, CancellationToken ct)
+    {
+        for (int i = 0; i < ReadyAttempts; i++)
+        {
+            if (proc.HasExited)
+                return $"cntlm 提前退出（码 {proc.ExitCode}）";
+            if (await MeasureTcpAsync("127.0.0.1", listen, CancellationToken.None, ReadyTimeoutMs) >= 0)
+                return null;
+            await Task.Delay(ReadyPollMs, ct);
+        }
+        return "测试实例未就绪：端口未监听";
+    }
+
+    // ---------------- TCP 延迟 ----------------
+
+    private static async Task<int> MeasureTcpAsync(string host, int port, CancellationToken ct, int timeoutMs = TcpTimeoutMs)
+    {
         var sw = Stopwatch.StartNew();
+        using var client = new TcpClient();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(timeoutMs);
         try
         {
-            using var response = await client
-                .GetAsync(_url, HttpCompletionOption.ResponseHeadersRead, linked.Token)
-                .ConfigureAwait(false);
-            sw.Stop();
-            bench.HttpStatus = (int)response.StatusCode;
-            if (!response.IsSuccessStatusCode)
-            {
-                bench.RelayMs = -1;
-                bench.Detail = $"HTTP {(int)response.StatusCode}";
-                return false;
-            }
-
-            bench.RelayMs = (int)sw.ElapsedMilliseconds;
-            bench.Detail = $"HTTP {(int)response.StatusCode}";
-            return true;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (OperationCanceledException)
-        {
-            bench.RelayMs = -1;
-            bench.Detail = "整链请求超时";
-            return false;
-        }
-        catch (Exception ex)
-        {
-            bench.RelayMs = -1;
-            bench.Detail = $"整链请求失败：{ex.Message}";
-            return false;
-        }
-    }
-
-    private async Task SpeedTestAsync(HttpClient client, ProxyBench bench, CancellationToken cancellationToken)
-    {
-        long total = 0;
-        var completed = false;
-        var timedOut = false;
-        var httpOk = true;
-        var detail = "";
-
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(_speedTimeoutSec));
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, cancellationToken);
-        var sw = Stopwatch.StartNew();
-
-        try
-        {
-            using var request = new HttpRequestMessage(HttpMethod.Get, _url);
-            request.Headers.Range = new RangeHeaderValue(0, _maxBytes - 1);
-            request.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
-
-            using var response = await client
-                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, linked.Token)
-                .ConfigureAwait(false);
-
-            if (!response.IsSuccessStatusCode)
-            {
-                httpOk = false;
-                detail = $"HTTP {(int)response.StatusCode}";
-            }
-            else
-            {
-                using var stream = await response.Content.ReadAsStreamAsync(linked.Token).ConfigureAwait(false);
-                var buffer = new byte[80 * 1024];
-                while (total < _maxBytes)
-                {
-                    int read;
-                    try
-                    {
-                        read = await stream.ReadAsync(buffer, linked.Token).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-                    {
-                        timedOut = true;
-                        break;
-                    }
-
-                    if (read <= 0)
-                    {
-                        completed = true;
-                        break;
-                    }
-
-                    total += read;
-                    if (total >= _maxBytes)
-                    {
-                        completed = true;
-                        break;
-                    }
-                }
-            }
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (OperationCanceledException)
-        {
-            timedOut = true;
-        }
-        catch (Exception ex)
-        {
-            httpOk = false;
-            detail = ex.Message;
-        }
-
-        sw.Stop();
-        var elapsedMs = Math.Max(1, sw.ElapsedMilliseconds);
-
-        bench.SpeedBytes = total;
-        bench.SpeedMs = elapsedMs;
-
-        if (!httpOk)
-        {
-            bench.SpeedBps = -1;
-            bench.SpeedOk = false;
-            bench.SpeedDetail = string.IsNullOrWhiteSpace(detail) ? "吞吐测试失败" : detail;
-            return;
-        }
-
-        var valid = total > 0 && (completed || timedOut);
-        if (!valid)
-        {
-            bench.SpeedBps = -1;
-            bench.SpeedOk = false;
-            bench.SpeedDetail = "未收到任何数据";
-            return;
-        }
-
-        bench.SpeedBps = total * 1000 / elapsedMs;
-        bench.SpeedOk = true;
-        bench.SpeedDetail = timedOut
-            ? $"已下载 {ProxyBench.FormatBytes(total)}（超时截断）"
-            : $"已下载 {ProxyBench.FormatBytes(total)}";
-    }
-
-    private string BuildBenchConfig(string proxy, int listenPort)
-    {
-        var sb = new StringBuilder();
-        sb.AppendLine("# CntlmGUI bench configuration (temporary)");
-        sb.AppendLine();
-
-        var hasHashes = !string.IsNullOrWhiteSpace(_settings.PassLM)
-                        || !string.IsNullOrWhiteSpace(_settings.PassNT)
-                        || !string.IsNullOrWhiteSpace(_settings.PassNTLMv2);
-        var usable = !string.IsNullOrWhiteSpace(_settings.Username)
-                     && (_settings.UseSspi || hasHashes || !string.IsNullOrEmpty(_settings.Password));
-
-        if (usable)
-        {
-            if (!string.IsNullOrWhiteSpace(_settings.Username)) sb.AppendLine("Username " + _settings.Username.Trim());
-            if (!string.IsNullOrWhiteSpace(_settings.Domain)) sb.AppendLine("Domain " + _settings.Domain.Trim());
-            if (!string.IsNullOrWhiteSpace(_settings.Workstation)) sb.AppendLine("Workstation " + _settings.Workstation.Trim());
-            if (hasHashes)
-            {
-                if (!string.IsNullOrWhiteSpace(_settings.PassLM)) sb.AppendLine("PassLM " + _settings.PassLM.Trim());
-                if (!string.IsNullOrWhiteSpace(_settings.PassNT)) sb.AppendLine("PassNT " + _settings.PassNT.Trim());
-                if (!string.IsNullOrWhiteSpace(_settings.PassNTLMv2)) sb.AppendLine("PassNTLMv2 " + _settings.PassNTLMv2.Trim());
-            }
-            else if (!string.IsNullOrEmpty(_settings.Password))
-            {
-                sb.AppendLine("Password \"" + _settings.Password.Replace("\"", "\\\"") + "\"");
-            }
-
-            if (!string.IsNullOrWhiteSpace(_settings.Auth)) sb.AppendLine("Auth " + _settings.Auth.Trim());
-            if (!string.IsNullOrWhiteSpace(_settings.Flags))
-            {
-                var flags = _settings.Flags.Trim();
-                if (!flags.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) flags = "0x" + flags;
-                sb.AppendLine("Flags " + flags);
-            }
-            if (_settings.UseSspi)
-                sb.AppendLine("SSPI " + (string.IsNullOrWhiteSpace(_settings.SspiType) ? "NTLM" : _settings.SspiType.Trim()));
-        }
-        else
-        {
-            sb.AppendLine("Username    cntlmgui");
-            sb.AppendLine("PassNT      77B9081511704EE852F94227CF48A793");
-            sb.AppendLine("Auth        NT");
-        }
-
-        sb.AppendLine();
-        sb.AppendLine("Proxy " + proxy);
-        sb.AppendLine($"Listen 127.0.0.1:{listenPort}");
-        return sb.ToString();
-    }
-
-    /// <summary>稳定排序：整链可用 → 吞吐有效 → 速度降序 → 整链耗时升序 → TCP 延迟升序。</summary>
-    public static List<string> SortProxies(IEnumerable<string> proxies, IEnumerable<ProxyBench> results)
-    {
-        var map = new Dictionary<string, ProxyBench>(StringComparer.OrdinalIgnoreCase);
-        foreach (var result in results)
-        {
-            map[result.Line] = result;
-        }
-
-        return proxies
-            .Select(line => (Line: line, Bench: map.TryGetValue(line, out var found) ? found : null))
-            .OrderByDescending(item => item.Bench?.RelayOk == true)
-            .ThenByDescending(item => item.Bench?.SpeedOk == true)
-            .ThenByDescending(item => item.Bench?.SpeedBps ?? long.MinValue)
-            .ThenBy(item => item.Bench?.RelayOk == true ? item.Bench.RelayMs : int.MaxValue)
-            .ThenBy(item => item.Bench?.TcpOk == true ? item.Bench.TcpMs : int.MaxValue)
-            .Select(item => item.Line)
-            .ToList();
-    }
-
-    private static ProxyBench Clone(ProxyBench source) => source with { };
-
-    private static async Task<int> TcpLatencyAsync(string host, int port, CancellationToken cancellationToken)
-    {
-        using var timeout = new CancellationTokenSource(TcpTimeoutMs);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token, cancellationToken);
-        var sw = Stopwatch.StartNew();
-        try
-        {
-            using var client = new TcpClient();
-            await client.ConnectAsync(host, port, linked.Token).ConfigureAwait(false);
+            await client.ConnectAsync(host, port, cts.Token);
             sw.Stop();
             return (int)sw.ElapsedMilliseconds;
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
         }
         catch
         {
@@ -421,79 +245,136 @@ public sealed class ProxySpeedTest
         }
     }
 
-    private static int GetFreePort()
+    // ---------------- 整链实测（临时 cntlm）----------------
+
+    private async Task<(bool ok, int ms, int status, string err)> RelayOnceAsync(
+        int listen, string target, CancellationToken ct)
     {
-        var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            using var handler = new HttpClientHandler
+            {
+                Proxy = new WebProxy("127.0.0.1", listen),
+                UseProxy = true,
+            };
+            using var client = new HttpClient(handler);
+            using var cts = new CancellationTokenSource(RelayTimeoutMs);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, cts.Token);
+            using var resp = await client.SendAsync(
+                new HttpRequestMessage(HttpMethod.Get, target),
+                HttpCompletionOption.ResponseHeadersRead,
+                linked.Token);
+            sw.Stop();
+            return (true, (int)sw.ElapsedMilliseconds, (int)resp.StatusCode, "");
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return (false, -1, 0, $"超时：{RelayTimeoutMs / 1000}s 内未完成");
+        }
+        catch (Exception ex)
+        {
+            return (false, -1, 0, Short((ex.InnerException ?? ex).Message));
+        }
+    }
+
+    /// <summary>
+    /// 经指定 cntlm 实例下载最多 maxBytes 字节，统计平均速度。
+    /// 用 Range 限制大小；服务器忽略 Range 时也只读到 maxBytes 为止。
+    /// 下满 maxBytes 或到达 timeoutSec，先到哪个就停止，按已下载字节计算速度；
+    /// 只有“一个字节都没收到”或 HTTP 错误才算失败。
+    /// 数据只进内存缓冲，不落盘。
+    /// </summary>
+    private static async Task<(bool ok, long bps, long bytes, int ms, string err)> ThroughputOnceAsync(
+        int listen, string url, long maxBytes, int timeoutSec, CancellationToken ct)
+    {
+        using var handler = new HttpClientHandler
+        {
+            Proxy = new WebProxy("127.0.0.1", listen),
+            UseProxy = true,
+        };
+        using var client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Max(1, timeoutSec)));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, cts.Token);
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        req.Headers.Range = new RangeHeaderValue(0, Math.Max(0, maxBytes - 1));
+        req.Headers.CacheControl = new CacheControlHeaderValue { NoCache = true };
+
+        var sw = Stopwatch.StartNew();
+        long total = 0;
+        try
+        {
+            using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, linked.Token);
+            if (!resp.IsSuccessStatusCode)
+            {
+                sw.Stop();
+                return (false, 0, 0, (int)sw.ElapsedMilliseconds, $"HTTP {(int)resp.StatusCode}");
+            }
+
+            using var stream = await resp.Content.ReadAsStreamAsync(linked.Token);
+            var buffer = new byte[81920];
+            bool eof = false;
+            while (total < maxBytes)
+            {
+                int toRead = (int)Math.Min(buffer.Length, maxBytes - total);
+                int n = await stream.ReadAsync(buffer.AsMemory(0, toRead), linked.Token);
+                if (n <= 0) { eof = true; break; }
+                total += n;
+            }
+
+            sw.Stop();
+            var bps = sw.Elapsed.TotalSeconds > 0 ? (long)(total / sw.Elapsed.TotalSeconds) : 0;
+            // 读满上限，或目标本身就这么大（完整响应）都算有效测量
+            var ok = total >= maxBytes || eof;
+            return (ok, bps, total, (int)sw.ElapsedMilliseconds,
+                total >= maxBytes ? "" : $"完整响应：{ProxyBench.FormatBytes(total)}");
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            sw.Stop();
+            var bps = sw.Elapsed.TotalSeconds > 0 ? (long)(total / sw.Elapsed.TotalSeconds) : 0;
+            // 时间到：已经有数据就是一次有效测量（按已下载字节算速度）；一个字节都没收到才算失败
+            var ok = total > 0;
+            return (ok, bps, total, (int)sw.ElapsedMilliseconds,
+                ok
+                    ? $"达到 {timeoutSec}s 上限（已下载 {ProxyBench.FormatBytes(total)}）"
+                    : $"超时：{timeoutSec}s 内未收到数据");
+        }
+        catch (Exception ex)
+        {
+            sw.Stop();
+            return (false, 0, total, (int)sw.ElapsedMilliseconds, Short((ex.InnerException ?? ex).Message));
+        }
+    }
+
+    private static string Short(string s)
+    {
+        int nl = s.IndexOf('\n');
+        if (nl >= 0) s = s[..nl];
+        return s.Length > 160 ? s[..160] : s;
+    }
+
+    private static int AllocLocalPort()
+    {
+        using var t = new TcpListener(IPAddress.Loopback, 0);
+        t.Start();
+        var port = ((IPEndPoint)t.LocalEndpoint).Port;
+        t.Stop();
         return port;
     }
 
-    private static bool Probe(int port)
+    /// <summary>清理上次异常退出遗留的临时文件（正常结束时都会在 finally 删除）。</summary>
+    private void CleanupOldBenchFiles()
     {
         try
         {
-            using var cts = new CancellationTokenSource(500);
-            using var client = new TcpClient();
-            client.ConnectAsync(IPAddress.Loopback, port, cts.Token).GetAwaiter().GetResult();
-            return client.Connected;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static (string Host, int Port)? ParseProxy(string line)
-    {
-        var text = line.Trim();
-        var at = text.LastIndexOf('@');
-        if (at >= 0) text = text[(at + 1)..];
-
-        var idx = text.LastIndexOf(':');
-        if (idx <= 0) return null;
-
-        var host = text[..idx].Trim().Trim('[', ']');
-        if (host.Length == 0) return null;
-        if (!int.TryParse(text[(idx + 1)..].Trim(), out var port)) return null;
-        if (port is < 1 or > 65535) return null;
-        return (host, port);
-    }
-
-    private static void CleanupOldFiles(string benchDir)
-    {
-        try
-        {
-            if (!Directory.Exists(benchDir)) return;
-            foreach (var file in Directory.GetFiles(benchDir))
+            foreach (var f in Directory.GetFiles(_workDir, "bench-*"))
             {
-                try
-                {
-                    if (DateTime.UtcNow - File.GetLastWriteTimeUtc(file) > TimeSpan.FromHours(6))
-                        File.Delete(file);
-                }
-                catch
-                {
-                    // 忽略
-                }
+                try { if (DateTime.Now - File.GetLastWriteTime(f) > TimeSpan.FromHours(6)) File.Delete(f); }
+                catch { }
             }
         }
-        catch
-        {
-            // 忽略
-        }
-    }
-
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            if (File.Exists(path)) File.Delete(path);
-        }
-        catch
-        {
-            // 忽略
-        }
+        catch { }
     }
 }

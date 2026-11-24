@@ -1,538 +1,186 @@
+using System;
+using System.Collections.Generic;
 using System.Drawing;
-using System.Runtime.InteropServices;
+using System.Windows.Forms;
 using CntlmGUI.Models;
 
 namespace CntlmGUI;
 
 /// <summary>
-/// 代理列表控件：就地编辑、排序、占位行与测速结果展示。
+/// 代理测速结果列表：列定义、行内容、跑马灯与“双击添加”占位行都在这里，
+/// 表单只负责按钮、菜单和就地编辑事件。
 /// </summary>
-public sealed class ProxyResultList : UserControl
+public sealed class ProxyResultList : ListView
 {
-    private const int LvmEditLabel = 0x1000 + 118;
-    private const int GwlStyle = -16;
-    private const int WsVscroll = 0x00200000;
-    private static readonly object PlaceholderTag = new();
+    public const string AddRowMarker = "\u2605ADD\u2605";
+    public const string AddRowHint = "双击这里可添加代理  <IP:Port>";
 
-    private readonly GuiSettings _settings;
-    private readonly ListView _list;
-    private readonly Font _placeholderFont;
-    private readonly ContextMenuStrip _menu;
-    private readonly ToolStripMenuItem _menuEdit;
-    private readonly ToolStripMenuItem _menuDelete;
-    private readonly ToolStripMenuItem _menuUp;
-    private readonly ToolStripMenuItem _menuDown;
-    private readonly ToolStripMenuItem _menuTop;
-    private readonly List<string> _proxies = new();
+    private static readonly Font AddRowFont = new(AppTheme.Ui, FontStyle.Italic);
 
-    public ProxyResultList(GuiSettings settings)
+    public ProxyResultList()
     {
-        _settings = settings;
+        Dock = DockStyle.Fill;
+        FullRowSelect = true;
+        View = View.Details;
+        GridLines = true;
+        HideSelection = false;
+        BorderStyle = BorderStyle.FixedSingle;
+        LabelEdit = true;
 
-        _placeholderFont = new Font(AppTheme.Ui.FontFamily, AppTheme.Ui.Size, FontStyle.Italic);
+        Columns.Add("代理", 190);
+        Columns.Add("TCP 连通", 70);
+        Columns.Add("首字节(ms)", 90);
+        Columns.Add("HTTP 状态", 75);
+        Columns.Add("下载速度", 110);
+        Columns.Add("说明", 260);
 
-        _list = new ListView
+        // 末列锁死、自动贴满剩余宽度；前列可自由拖动
+        ColumnWidthChanging += (_, e) =>
         {
-            Dock = DockStyle.Fill,
-            View = View.Details,
-            FullRowSelect = true,
-            GridLines = true,
-            LabelEdit = true,
-            HideSelection = false,
-            MultiSelect = false,
-            BorderStyle = BorderStyle.FixedSingle,
-            Font = AppTheme.Ui,
-            HeaderStyle = ColumnHeaderStyle.Nonclickable,
-            TabIndex = 0,
+            if (e.ColumnIndex == Columns.Count - 1) e.Cancel = true;
         };
-        _list.Columns.Add("代理", 190);
-        _list.Columns.Add("TCP 连通", 70);
-        _list.Columns.Add("首字节(ms)", 90);
-        _list.Columns.Add("HTTP 状态", 75);
-        _list.Columns.Add("下载速度", 110);
-        _list.Columns.Add("说明", 260);
-        Controls.Add(_list);
-
-        _menu = new ContextMenuStrip { Font = AppTheme.Ui };
-        var add = new ToolStripMenuItem("添加代理…");
-        add.Click += (_, _) => AddProxiesInteractive();
-        _menuEdit = new ToolStripMenuItem("编辑选中");
-        _menuEdit.Click += (_, _) => BeginEditSelected();
-        _menuDelete = new ToolStripMenuItem("删除选中");
-        _menuDelete.Click += (_, _) => DeleteSelected();
-        _menuUp = new ToolStripMenuItem("上移");
-        _menuUp.Click += (_, _) => MoveUp();
-        _menuDown = new ToolStripMenuItem("下移");
-        _menuDown.Click += (_, _) => MoveDown();
-        _menuTop = new ToolStripMenuItem("设为第一顺位");
-        _menuTop.Click += (_, _) => MoveToTop();
-
-        _menu.Items.Add(add);
-        _menu.Items.Add(_menuEdit);
-        _menu.Items.Add(_menuDelete);
-        _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add(_menuUp);
-        _menu.Items.Add(_menuDown);
-        _menu.Items.Add(_menuTop);
-        _menu.Opening += (_, _) => UpdateMenuState();
-        _list.ContextMenuStrip = _menu;
-
-        _list.AfterLabelEdit += OnAfterLabelEdit;
-        _list.DoubleClick += OnDoubleClick;
-        _list.MouseDown += OnMouseDown;
-        _list.KeyDown += OnKeyDown;
-        _list.SelectedIndexChanged += (_, _) => SelectionChanged?.Invoke(this, EventArgs.Empty);
-        _list.Resize += (_, _) => AdjustColumns();
-
-        foreach (var line in TextLines.Split(settings.ProxyList)) _proxies.Add(line);
-        Rebuild();
+        ColumnWidthChanged += (_, _) => FitLastColumn();
+        Resize += (_, _) => FitLastColumn();
     }
 
-    public event EventHandler? SelectionChanged;
-    public event EventHandler? OrderChanged;
-
-    public IReadOnlyList<string> Proxies => _proxies;
-
-    public string? SelectedLine
+    /// <summary>按给定顺序重建列表；有上次结果的代理直接回显，其余显示“待测”。</summary>
+    public void ShowCandidates(IEnumerable<string> lines, IReadOnlyDictionary<string, ProxyBench> results)
     {
-        get
-        {
-            if (_list.SelectedItems.Count == 0) return null;
-            return _list.SelectedItems[0].Tag as string;
-        }
-    }
-
-    public bool HasSelection => SelectedLine != null;
-    public bool CanMoveUp => SelectedIndex > 0;
-    public bool CanMoveDown => SelectedIndex >= 0 && SelectedIndex < _proxies.Count - 1;
-    public bool CanMoveTop => SelectedIndex > 0;
-
-    private int SelectedIndex
-    {
-        get
-        {
-            if (_list.SelectedIndices.Count == 0) return -1;
-            var index = _list.SelectedIndices[0];
-            return index >= 0 && index < _proxies.Count ? index : -1;
-        }
-    }
-
-    public void SetProxies(IEnumerable<string> lines, bool persist = true)
-    {
-        _proxies.Clear();
-        foreach (var raw in lines)
-        {
-            var line = raw.Trim();
-            if (line.Length == 0) continue;
-            if (_proxies.Any(item => item.Equals(line, StringComparison.OrdinalIgnoreCase))) continue;
-            _proxies.Add(line);
-        }
-
-        Rebuild();
-        if (persist) Persist();
-    }
-
-    public void ShowResult(ProxyBench bench)
-    {
-        var item = FindItem(bench.Line);
-        if (item == null) return;
-        FillRow(item, bench);
-    }
-
-    public void SetDetail(string line, string detail)
-    {
-        var item = FindItem(line);
-        if (item == null) return;
-        if (item.SubItems.Count > 5) item.SubItems[5].Text = detail;
-    }
-
-    public void BeginEditSelected()
-    {
-        var index = SelectedIndex;
-        if (index < 0) return;
-        BeginEdit(index);
-    }
-
-    public void AddProxiesInteractive()
-    {
-        using var dialog = new Form
-        {
-            Text = "添加代理",
-            ClientSize = new Size(440, 280),
-            FormBorderStyle = FormBorderStyle.FixedDialog,
-            StartPosition = FormStartPosition.CenterParent,
-            MaximizeBox = false,
-            MinimizeBox = false,
-            Font = AppTheme.Ui,
-            BackColor = Color.White,
-        };
-
-        var box = new TextBox
-        {
-            Multiline = true,
-            ScrollBars = ScrollBars.Vertical,
-            Font = AppTheme.Mono,
-            Location = new Point(16, 16),
-            Size = new Size(408, 178),
-        };
-        var hint = new Label
-        {
-            Text = "每行一个，格式 IP:Port（可带 user:pass@ 前缀），重复行会被跳过。",
-            Font = AppTheme.UiSmall,
-            ForeColor = AppTheme.Muted,
-            Location = new Point(16, 200),
-            Size = new Size(408, 20),
-        };
-        var ok = AppTheme.CreateButton("添加", true);
-        ok.Location = new Point(264, 230);
-        ok.DialogResult = DialogResult.OK;
-        var cancel = AppTheme.CreateButton("取消");
-        cancel.Location = new Point(360, 230);
-        cancel.DialogResult = DialogResult.Cancel;
-
-        dialog.Controls.Add(box);
-        dialog.Controls.Add(hint);
-        dialog.Controls.Add(ok);
-        dialog.Controls.Add(cancel);
-        dialog.AcceptButton = ok;
-        dialog.CancelButton = cancel;
-
-        if (dialog.ShowDialog(FindForm()) != DialogResult.OK) return;
-
-        var invalid = new List<string>();
-        var added = 0;
-        foreach (var raw in TextLines.Split(box.Text))
-        {
-            if (!IsValidProxy(raw))
-            {
-                invalid.Add(raw);
-                continue;
-            }
-
-            if (_proxies.Any(item => item.Equals(raw, StringComparison.OrdinalIgnoreCase))) continue;
-            _proxies.Add(raw);
-            added++;
-        }
-
-        if (added > 0)
-        {
-            Rebuild();
-            Persist();
-        }
-
-        if (invalid.Count > 0)
-        {
-            MessageBox.Show(FindForm(), "以下行格式无效，已跳过：\r\n" + string.Join("\r\n", invalid),
-                "添加代理", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-        }
-    }
-
-    public void DeleteSelected()
-    {
-        var index = SelectedIndex;
-        if (index < 0) return;
-
-        _proxies.RemoveAt(index);
-        Rebuild();
-        Persist();
-    }
-
-    public void MoveUp()
-    {
-        var index = SelectedIndex;
-        if (index <= 0) return;
-        Swap(index, index - 1);
-    }
-
-    public void MoveDown()
-    {
-        var index = SelectedIndex;
-        if (index < 0 || index >= _proxies.Count - 1) return;
-        Swap(index, index + 1);
-    }
-
-    public void MoveToTop()
-    {
-        var index = SelectedIndex;
-        if (index <= 0) return;
-        var line = _proxies[index];
-        _proxies.RemoveAt(index);
-        _proxies.Insert(0, line);
-        Rebuild();
-        Persist();
-    }
-
-    private void Swap(int a, int b)
-    {
-        var line = _proxies[a];
-        _proxies[a] = _proxies[b];
-        _proxies[b] = line;
-        Rebuild();
-        Persist();
-    }
-
-    private void Persist()
-    {
-        _settings.ProxyList = string.Join("\r\n", _proxies);
-        _settings.LastBench = _settings.LastBench
-            .Where(item => _proxies.Any(line => line.Equals(item.Line, StringComparison.OrdinalIgnoreCase)))
-            .ToList();
-
+        BeginUpdate();
         try
         {
-            _settings.Save();
-        }
-        catch
-        {
-            // 保存失败不阻塞界面
-        }
-
-        OrderChanged?.Invoke(this, EventArgs.Empty);
-    }
-
-    private void Rebuild()
-    {
-        var selected = SelectedLine;
-
-        _list.BeginUpdate();
-        try
-        {
-            _list.Items.Clear();
-            foreach (var line in _proxies)
+            Items.Clear();
+            foreach (var line in lines)
             {
-                var item = new ListViewItem(line);
-                for (var i = 1; i < 6; i++) item.SubItems.Add("");
-                item.Tag = line;
-
-                var bench = _settings.LastBench.FirstOrDefault(
-                    entry => entry.Line.Equals(line, StringComparison.OrdinalIgnoreCase));
-                if (bench != null) FillRow(item, bench);
-
-                _list.Items.Add(item);
+                results.TryGetValue(line, out var r);
+                Items.Add(NewRow(line, r));
             }
-
-            var placeholder = new ListViewItem("双击这里可添加代理  IP:Port");
-            for (var i = 1; i < 6; i++) placeholder.SubItems.Add("");
-            placeholder.Tag = PlaceholderTag;
-            placeholder.ForeColor = Color.Gray;
-            placeholder.Font = _placeholderFont;
-            _list.Items.Add(placeholder);
+            AppendAddRow();
         }
         finally
         {
-            _list.EndUpdate();
+            EndUpdate();
         }
-
-        if (selected != null)
-        {
-            var item = FindItem(selected);
-            if (item != null)
-            {
-                item.Selected = true;
-                item.Focused = true;
-                _list.EnsureVisible(item.Index);
-            }
-        }
-
-        AdjustColumns();
-        if (IsHandleCreated) BeginInvoke(new Action(AdjustColumns));
+        FitLastColumn();
     }
 
-    protected override void OnHandleCreated(EventArgs e)
+    /// <summary>测速开始：所有代理回到“待测”，等待逐条回填。</summary>
+    public void ShowPending(IEnumerable<string> lines)
     {
-        base.OnHandleCreated(e);
-        AdjustColumns();
-    }
-
-    private static void FillRow(ListViewItem item, ProxyBench bench)
-    {
-        item.SubItems[1].Text = bench.TcpText;
-        item.SubItems[2].Text = bench.RelayText;
-        item.SubItems[3].Text = bench.HttpText;
-        item.SubItems[4].Text = bench.SpeedText;
-        item.SubItems[5].Text = bench.Summary;
-    }
-
-    private ListViewItem? FindItem(string line)
-    {
-        foreach (ListViewItem item in _list.Items)
-        {
-            if (item.Tag is string text && text.Equals(line, StringComparison.OrdinalIgnoreCase))
-                return item;
-        }
-        return null;
-    }
-
-    private void BeginEdit(int index)
-    {
-        if (index < 0 || index >= _list.Items.Count) return;
-        _list.EnsureVisible(index);
-        _list.Focus();
-        SendMessage(_list.Handle, LvmEditLabel, (IntPtr)index, IntPtr.Zero);
-    }
-
-    private void OnAfterLabelEdit(object? sender, LabelEditEventArgs e)
-    {
-        var index = e.Item;
-        if (index < 0 || index >= _list.Items.Count) return;
-
-        var item = _list.Items[index];
-        if (item.Tag is not string oldLine)
-        {
-            e.CancelEdit = true;
-            return;
-        }
-
-        if (e.Label == null) return;
-
-        var text = e.Label.Trim();
-        if (text.Length == 0)
-        {
-            e.CancelEdit = true;
-            return;
-        }
-
-        if (!IsValidProxy(text))
-        {
-            e.CancelEdit = true;
-            MessageBox.Show(FindForm(), "代理格式无效，请使用 IP:Port。", "编辑代理",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
-        if (_proxies.Any(line => !line.Equals(oldLine, StringComparison.OrdinalIgnoreCase)
-                                 && line.Equals(text, StringComparison.OrdinalIgnoreCase)))
-        {
-            e.CancelEdit = true;
-            MessageBox.Show(FindForm(), "该代理已存在。", "编辑代理",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
-        if (text.Equals(oldLine, StringComparison.Ordinal)) return;
-
-        var proxyIndex = _proxies.FindIndex(line => line.Equals(oldLine, StringComparison.OrdinalIgnoreCase));
-        if (proxyIndex < 0) return;
-
-        _proxies[proxyIndex] = text;
-
-        var bench = _settings.LastBench.FirstOrDefault(
-            entry => entry.Line.Equals(oldLine, StringComparison.OrdinalIgnoreCase));
-        if (bench != null) bench.Line = text;
-
-        _settings.ProxyList = string.Join("\r\n", _proxies);
+        BeginUpdate();
         try
         {
-            _settings.Save();
+            Items.Clear();
+            foreach (var line in lines) Items.Add(NewRow(line, null));
+            AppendAddRow();
+        }
+        finally
+        {
+            EndUpdate();
+        }
+        FitLastColumn();
+    }
+
+    /// <summary>把一条测速结果写进对应行。</summary>
+    public void UpdateRow(ProxyBench b)
+    {
+        foreach (ListViewItem item in Items)
+        {
+            if (item.Tag as string != b.Line) continue;
+            var cells = item.SubItems;
+            cells[1].Text = b.TcpText;
+            cells[2].Text = b.TcpOk && b.RelayOk ? b.RelayText : b.TcpOk ? "失败" : "—";
+            cells[3].Text = b.HttpStatus > 0 ? b.HttpStatus.ToString() : "—";
+            cells[4].Text = b.SpeedTested ? b.SpeedText : "—";
+            cells[5].Text = b.Summary;
+            item.ToolTipText = b.Summary;
+            break;
+        }
+    }
+
+    /// <summary>测速期间，未完成的行在“说明”列显示循环的“测速中...”。</summary>
+    public void AnimatePending(ISet<string> pending, int phase)
+    {
+        if (pending.Count == 0) return;
+        var dots = new string('.', phase);
+        BeginUpdate();
+        try
+        {
+            foreach (ListViewItem item in Items)
+            {
+                if (item.Tag is string line && pending.Contains(line))
+                    item.SubItems[5].Text = "测速中" + dots;
+            }
+        }
+        finally
+        {
+            EndUpdate();
+        }
+    }
+
+    public bool IsAddRow(int index) =>
+        index >= 0 && index < Items.Count && Items[index].Tag is string s && s == AddRowMarker;
+
+    public void AppendAddRow()
+    {
+        var item = new ListViewItem(AddRowHint) { Tag = AddRowMarker, ForeColor = AppTheme.Muted, Font = AddRowFont };
+        for (int i = 0; i < 5; i++) item.SubItems.Add("");
+        Items.Add(item);
+    }
+
+    /// <summary>把某行恢复成“双击添加”占位提示（编辑被取消/清空时调用）。</summary>
+    public void RestoreAddHint(int row)
+    {
+        if (row < 0 || row >= Items.Count) return;
+        var item = Items[row];
+        item.Text = AddRowHint;
+        item.Tag = AddRowMarker;
+        item.ForeColor = AppTheme.Muted;
+        item.Font = AddRowFont;
+        for (int i = 1; i < item.SubItems.Count; i++) item.SubItems[i].Text = "";
+    }
+
+    /// <summary>末列始终填满剩余宽度；只有真的出现垂直滚动条时才为其预留空间。</summary>
+    public void FitLastColumn()
+    {
+        if (Columns.Count == 0) return;
+        int total = ClientSize.Width - (HasVerticalScrollbar() ? SystemInformation.VerticalScrollBarWidth : 0);
+        int used = 0;
+        for (int i = 0; i < Columns.Count - 1; i++) used += Columns[i].Width;
+        Columns[^1].Width = Math.Max(40, total - used);
+    }
+
+    private bool HasVerticalScrollbar()
+    {
+        if (Items.Count == 0) return false;
+        try
+        {
+            var first = GetItemRect(0, ItemBoundsPortion.Entire);
+            if (first.IsEmpty || first.Height <= 0) return false;
+            return (long)Items.Count * first.Height >= ClientSize.Height;
         }
         catch
         {
-            // 忽略
+            return false;
         }
-
-        OrderChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    private void OnDoubleClick(object? sender, EventArgs e)
+    private static ListViewItem NewRow(string line, ProxyBench? r)
     {
-        var info = _list.HitTest(_list.PointToClient(Cursor.Position));
-        if (info.Item == null) return;
-
-        _list.SelectedItems.Clear();
-        info.Item.Selected = true;
-        info.Item.Focused = true;
-
-        if (info.Item.Tag == PlaceholderTag)
+        var item = new ListViewItem(line) { Tag = line };
+        if (r == null)
         {
-            AddProxiesInteractive();
-            return;
+            for (int i = 0; i < 5; i++) item.SubItems.Add("");
+            item.SubItems[1].Text = "待测";
+            return item;
         }
 
-        var index = info.Item.Index;
-        BeginInvoke(new Action(() => BeginEdit(index)));
+        item.SubItems.Add(r.TcpText);
+        item.SubItems.Add(r.TcpOk && r.RelayOk ? r.RelayText : r.TcpOk ? "失败" : "—");
+        item.SubItems.Add(r.HttpStatus > 0 ? r.HttpStatus.ToString() : "—");
+        item.SubItems.Add(r.SpeedTested ? r.SpeedText : "—");
+        item.SubItems.Add(r.Summary);
+        item.ToolTipText = r.Summary;
+        return item;
     }
-
-    private void OnMouseDown(object? sender, MouseEventArgs e)
-    {
-        if (e.Button != MouseButtons.Right) return;
-        var info = _list.HitTest(e.Location);
-        if (info.Item == null) return;
-        _list.SelectedItems.Clear();
-        info.Item.Selected = true;
-        info.Item.Focused = true;
-    }
-
-    private void OnKeyDown(object? sender, KeyEventArgs e)
-    {
-        if (e.KeyCode == Keys.F2)
-        {
-            BeginEditSelected();
-            e.Handled = true;
-        }
-        else if (e.KeyCode == Keys.Delete)
-        {
-            DeleteSelected();
-            e.Handled = true;
-        }
-    }
-
-    private void UpdateMenuState()
-    {
-        var has = HasSelection;
-        _menuEdit.Enabled = has;
-        _menuDelete.Enabled = has;
-        _menuUp.Enabled = CanMoveUp;
-        _menuDown.Enabled = CanMoveDown;
-        _menuTop.Enabled = CanMoveTop;
-    }
-
-    private void AdjustColumns()
-    {
-        if (_list.Columns.Count < 6) return;
-
-        var fixedWidth = 190 + 70 + 90 + 75 + 110;
-        var scroll = VScrollVisible() ? SystemInformation.VerticalScrollBarWidth : 0;
-        var available = _list.ClientSize.Width - scroll - 2;
-        _list.Columns[5].Width = Math.Max(120, available - fixedWidth);
-    }
-
-    private bool VScrollVisible()
-    {
-        if (!_list.IsHandleCreated) return false;
-        var style = GetWindowLongPtr(_list.Handle, GwlStyle).ToInt64();
-        return (style & WsVscroll) != 0;
-    }
-
-    private static bool IsValidProxy(string line)
-    {
-        var text = line.Trim();
-        if (text.Length == 0) return false;
-
-        var at = text.LastIndexOf('@');
-        if (at >= 0) text = text[(at + 1)..];
-
-        var idx = text.LastIndexOf(':');
-        if (idx <= 0 || idx == text.Length - 1) return false;
-
-        var host = text[..idx].Trim().Trim('[', ']');
-        if (host.Length == 0) return false;
-
-        return int.TryParse(text[(idx + 1)..].Trim(), out var port) && port is >= 1 and <= 65535;
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing)
-        {
-            _placeholderFont.Dispose();
-            _menu.Dispose();
-        }
-        base.Dispose(disposing);
-    }
-
-    [DllImport("user32.dll", CharSet = CharSet.Auto)]
-    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
-
-    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
-    private static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
 }

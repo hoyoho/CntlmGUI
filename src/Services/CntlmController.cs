@@ -1,448 +1,244 @@
+using System;
 using System.Diagnostics;
+using System.IO;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using CntlmGUI.Models;
 
 namespace CntlmGUI.Services;
 
-public sealed record StatusInfo(bool Running, string Mode, string Detail);
+public enum EngineMode { Process, Service }
 
-public sealed class CntlmController
+public sealed record CntlmStatus(bool Running, string Detail);
+
+/// <summary>
+/// 负责把 UI 配置动态写成 cntlm.ini，并以“子进程”或“Windows 服务”方式
+/// 启动/停止 cntlm，同时轮询监听端口判断实际运行状态。
+/// </summary>
+public class CntlmController
 {
-    private readonly object _gate = new();
+    private const int ListenWaitMs = 4_000;
+    private const int ListenPollMs = 200;
+
+    private readonly GuiSettings _s;
     private Process? _process;
     private CancellationTokenSource? _tailCts;
-    private Thread? _tailThread;
+    private Task? _tailTask;
 
-    public CntlmController(GuiSettings settings) => Settings = settings;
+    public CntlmController(GuiSettings s) => _s = s;
 
-    public GuiSettings Settings { get; set; }
-
+    /// <summary>GUI 自身的操作日志（配置生成、启停动作、错误提示等）。</summary>
     public event Action<string>? Log;
+
+    /// <summary>cntlm 进程自身的输出（stdout/stderr 与 trace 日志内容）。</summary>
     public event Action<string>? CntlmLog;
 
-    public string EffectiveConfigPath
+    /// <summary>当前使用的 cntlm.exe 路径（启动时由 EnsureBinary 确定）。</summary>
+    public string Cmd { get; set; } = "";
+
+    public EngineMode Mode => _s.UseService ? EngineMode.Service : EngineMode.Process;
+
+    /// <summary>服务实际读取的 ini 路径；服务不存在或无法解析时为 null。</summary>
+    public string? ServiceConfigPath => CntlmService.ConfigPath(_s.ServiceName);
+
+    /// <summary>
+    /// 当前模式实际会写入/读取的 ini：
+    /// 服务模式优先使用服务自己的 -c 路径（否则服务根本不会读 GUI 的配置）。
+    /// </summary>
+    public string EffectiveConfigPath =>
+        Mode == EngineMode.Service && !string.IsNullOrWhiteSpace(ServiceConfigPath)
+            ? ServiceConfigPath!
+            : !string.IsNullOrWhiteSpace(_s.OutputConfigPath)
+                ? _s.OutputConfigPath
+                : GuiSettings.DefaultOutputConfig;
+
+    // ---------------- 配置 ----------------
+
+    /// <summary>写配置；失败时写日志并返回 false（调用方不应继续启动）。</summary>
+    public bool WriteConfig()
     {
-        get
-        {
-            var settings = Settings;
-            if (settings.UseService)
-            {
-                try
-                {
-                    var path = CntlmService.ConfigPath(settings.ServiceName);
-                    if (!string.IsNullOrWhiteSpace(path)) return path;
-                }
-                catch
-                {
-                    // 忽略
-                }
-            }
-
-            if (!string.IsNullOrWhiteSpace(settings.OutputConfigPath)) return settings.OutputConfigPath;
-            return GuiSettings.DefaultOutputConfigPath;
-        }
-    }
-
-    public bool Validate()
-    {
-        var settings = Settings;
-        if (!settings.UseProxy) return true;
-
-        if (TextLines.Split(settings.ProxyList).Length == 0)
-        {
-            LogNow("启用对外互联时必须至少配置一个上游代理。");
-            return false;
-        }
-
-        if (settings.UseSspi) return true;
-
-        if (string.IsNullOrWhiteSpace(settings.Username))
-        {
-            LogNow("请先在 设置 → 二级代理 → 上游认证 中填写用户名。");
-            return false;
-        }
-
-        var hasHash = !string.IsNullOrWhiteSpace(settings.PassLM)
-                      || !string.IsNullOrWhiteSpace(settings.PassNT)
-                      || !string.IsNullOrWhiteSpace(settings.PassNTLMv2);
-
-        if (!hasHash && string.IsNullOrEmpty(settings.Password))
-        {
-            LogNow("请填写上游认证密码，或使用「生成哈希」写入 PassLM/PassNT/PassNTLMv2。");
-            return false;
-        }
-
-        if (!string.IsNullOrEmpty(settings.Password)) return true;
-
-        var auth = (settings.Auth ?? "").Trim().ToUpperInvariant();
-        switch (auth)
-        {
-            case "LM":
-                if (string.IsNullOrWhiteSpace(settings.PassLM))
-                {
-                    LogNow("认证类型为 LM 时需要 PassLM。");
-                    return false;
-                }
-                break;
-            case "NT":
-                if (string.IsNullOrWhiteSpace(settings.PassNT))
-                {
-                    LogNow("认证类型为 NT 时需要 PassNT。");
-                    return false;
-                }
-                break;
-            case "NTLMV2":
-                if (string.IsNullOrWhiteSpace(settings.PassNTLMv2))
-                {
-                    LogNow("认证类型为 NTLMv2 时需要 PassNTLMv2。");
-                    return false;
-                }
-                break;
-            case "NTLM":
-                if (string.IsNullOrWhiteSpace(settings.PassLM) && string.IsNullOrWhiteSpace(settings.PassNT))
-                {
-                    LogNow("认证类型为 NTLM 时需要 PassLM 或 PassNT。");
-                    return false;
-                }
-                break;
-        }
-
-        return true;
-    }
-
-    public async Task StartAsync()
-    {
-        if (!Validate()) return;
-
-        var exe = Settings.EffectiveBaseCntlmPath();
-        if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe))
-        {
-            LogNow("未找到 cntlm.exe，请在 设置 → 运行设置 中指定路径。");
-            return;
-        }
-
-        var configPath = EffectiveConfigPath;
-        if (!WriteConfig(configPath)) return;
-
-        if (Settings.UseService)
-        {
-            var resolved = CntlmService.ConfigPath(Settings.ServiceName);
-            LogNow($"服务模式：实际使用的配置文件为 {configPath}");
-            if (resolved == null)
-                LogNow("未能解析到服务的实际配置路径，GUI 中的修改可能不生效。");
-            LogNow("服务模式不采集 cntlm 的 trace 日志。");
-
-            var result = await Task.Run(() => CntlmService.RunSc($"start \"{Settings.ServiceName}\"")).ConfigureAwait(false);
-            foreach (var line in SplitLines(result.Output)) LogNow(line);
-            if (result.ExitCode != 0) LogNow($"sc start 返回退出码 {result.ExitCode}。");
-            return;
-        }
-
-        StartProcess(exe, configPath);
-    }
-
-    public async Task StopAsync()
-    {
-        if (Settings.UseService)
-        {
-            var result = await Task.Run(() => CntlmService.RunSc($"stop \"{Settings.ServiceName}\"")).ConfigureAwait(false);
-            foreach (var line in SplitLines(result.Output)) LogNow(line);
-            if (result.ExitCode != 0) LogNow($"sc stop 返回退出码 {result.ExitCode}。");
-            return;
-        }
-
-        await Task.Run(KillProcess).ConfigureAwait(false);
-    }
-
-    public void StopOnExit()
-    {
-        if (Settings.UseService) return;
-        KillProcess();
-    }
-
-    public StatusInfo GetStatus()
-    {
-        var settings = Settings;
-        var mode = settings.UseService ? "服务" : "进程";
-        var (host, port) = GuiSettings.ParseListen(settings.Listen);
-        var listening = ProbePort(host, port);
-
-        if (settings.UseService)
-        {
-            bool running;
-            try
-            {
-                running = CntlmService.IsRunning(settings.ServiceName);
-            }
-            catch
-            {
-                running = false;
-            }
-
-            if (!running) return new StatusInfo(false, mode, "服务未运行");
-            var prefix = listening ? "端口已监听 · " : "";
-            return new StatusInfo(true, mode, $"{prefix}服务正在运行（{host}:{port}）");
-        }
-
-        Process? process;
-        lock (_gate) process = _process;
-
-        bool alive;
-        int pid = 0;
+        var path = Path.GetFullPath(EffectiveConfigPath);
+        var dir = Path.GetDirectoryName(path);
         try
         {
-            alive = process != null && !process.HasExited;
-            if (alive) pid = process!.Id;
-        }
-        catch
-        {
-            alive = false;
-        }
-
-        if (!listening && !alive)
-            return new StatusInfo(false, mode, $"未监听 {host}:{port}");
-
-        if (!listening)
-            return new StatusInfo(false, mode, "宿主进程存活但尚未检测到监听端口");
-
-        var detail = $"监听 {host}:{port}" + (pid > 0 ? $" · PID={pid}" : "");
-        return new StatusInfo(true, mode, detail);
-    }
-
-    private bool WriteConfig(string path)
-    {
-        try
-        {
-            CntlmConfigGenerator.WriteFile(path, Settings);
-            LogNow($"已生成 cntlm 配置：{path}");
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            File.WriteAllText(path, _s.RenderConfig(), new UTF8Encoding(false)); // cntlm 需要无 BOM 文件
+            Log?.Invoke($"已生成并写入配置: {path}");
             return true;
         }
         catch (UnauthorizedAccessException)
         {
-            LogNow($"没有权限写入 {path}。服务模式请以管理员身份运行 CntlmGUI。");
+            Log?.Invoke($"没有权限写入 {path}。服务模式请以管理员身份运行 CntlmGUI。");
             return false;
         }
         catch (Exception ex)
         {
-            LogNow($"写入配置失败：{ex.Message}");
+            Log?.Invoke($"写入配置失败: {path}：{ex.Message}");
             return false;
         }
     }
 
-    private void StartProcess(string exe, string configPath)
+    public string PreviewConfig() => _s.RenderConfig();
+
+    private bool EnsureBinary()
     {
-        KillProcess();
-
-        var trace = Settings.EnableTrace;
-        var tracePath = GuiSettings.TraceLogPath;
-        long startOffset = 0;
-
-        if (trace)
+        var exe = _s.EffectiveBaseCntlmPath();
+        if (!string.IsNullOrWhiteSpace(exe) && File.Exists(exe))
         {
-            try
-            {
-                if (File.Exists(tracePath)) File.Delete(tracePath);
-            }
-            catch
-            {
-                try
-                {
-                    startOffset = new FileInfo(tracePath).Exists ? new FileInfo(tracePath).Length : 0;
-                }
-                catch
-                {
-                    startOffset = 0;
-                }
-            }
+            Cmd = exe;
+            return true;
         }
+        Log?.Invoke("未找到 cntlm.exe，请在 设置 → 运行设置 中指定路径。");
+        return false;
+    }
 
-        var args = new StringBuilder();
-        if (trace) args.Append($"-T \"{tracePath}\" ");
-        args.Append($"-f -c \"{configPath}\"");
+    // ---------------- 启动 / 停止 ----------------
 
-        var psi = new ProcessStartInfo(exe, args.ToString())
+    public async Task StartAsync()
+    {
+        var err = Validate();
+        if (err != null)
+        {
+            Log?.Invoke(err);
+            return;
+        }
+        if (!EnsureBinary()) return;
+        if (!WriteConfig()) return;
+
+        if (Mode == EngineMode.Service)
+        {
+            var cfg = ServiceConfigPath;
+            Log?.Invoke(cfg == null
+                ? "未找到服务实际使用的配置路径；服务将使用它自己的配置，GUI 的修改可能不会生效。"
+                : $"服务模式：使用服务配置 {cfg}");
+            Log?.Invoke("服务模式不采集 cntlm 的 trace 日志。");
+            await Task.Run(() => RunServiceAction("start", _s.ServiceName));
+        }
+        else
+        {
+            await Task.Run(StartProcess);
+        }
+    }
+
+    /// <summary>启动前置校验：按是否启用上游、是否使用 SSPI、Auth 与哈希是否匹配分别检查。</summary>
+    public string? Validate()
+    {
+        // 未启用对外互联：生成器会写占位 Proxy/凭据，不需要用户配置上游
+        if (!_s.UseProxy) return null;
+
+        if (string.IsNullOrWhiteSpace(_s.ProxyList))
+            return "已启用对外互联，但未配置上游代理：请填写代理列表，或关闭“启用对外互联”。";
+        if (_s.UseSspi) return null; // SSPI 使用 Windows 当前登录身份
+
+        if (string.IsNullOrWhiteSpace(_s.Username))
+            return "未填写用户名（设置 → 二级代理 → 上游认证）。";
+        if (!TextLines.AnyNonEmpty(_s.PassLM, _s.PassNT, _s.PassNTLMv2) && string.IsNullOrWhiteSpace(_s.Password))
+            return "未配置认证凭据（哈希或明文密码），请设置后重试。";
+        if (!string.IsNullOrWhiteSpace(_s.Password)) return null;
+
+        bool hasLM = !string.IsNullOrWhiteSpace(_s.PassLM);
+        bool hasNT = !string.IsNullOrWhiteSpace(_s.PassNT);
+        bool hasV2 = !string.IsNullOrWhiteSpace(_s.PassNTLMv2);
+        return _s.Auth.Trim().ToUpperInvariant() switch
+        {
+            "LM" when !hasLM => "认证类型为 LM，但未填写 PassLM。",
+            "NT" when !hasNT => "认证类型为 NT，但未填写 PassNT。",
+            "NTLMV2" when !hasV2 => "认证类型为 NTLMv2，但未填写 PassNTLMv2。",
+            "NTLM" when !hasLM && !hasNT => "认证类型为 NTLM，但未填写 PassLM 或 PassNT。",
+            _ => null,
+        };
+    }
+
+    public async Task StopAsync()
+    {
+        if (Mode == EngineMode.Service)
+            await Task.Run(() => RunServiceAction("stop", _s.ServiceName));
+        else
+            await Task.Run(KillProcess);
+    }
+
+    // ---------------- 服务模式 ----------------
+
+    private void RunServiceAction(string op, string name)
+    {
+        Log?.Invoke($"执行 sc {op} {name} ...");
+        var (code, output) = RunSc(op, name);
+        Log?.Invoke(output.Trim());
+        if (code != 0)
+            Log?.Invoke("服务操作可能需要管理员权限（右键“以管理员身份运行”）。");
+    }
+
+    private static (int code, string output) RunSc(string op, string name)
+    {
+        var psi = new ProcessStartInfo("sc.exe", $"{op} {name}")
         {
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true,
-            WorkingDirectory = Path.GetDirectoryName(exe) ?? AppContext.BaseDirectory,
         };
-
-        var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
-        process.OutputDataReceived += (_, e) =>
-        {
-            if (!string.IsNullOrWhiteSpace(e.Data)) CntlmLog?.Invoke(e.Data);
-        };
-        process.ErrorDataReceived += (_, e) =>
-        {
-            if (!string.IsNullOrWhiteSpace(e.Data)) CntlmLog?.Invoke(e.Data);
-        };
-
-        lock (_gate) _process = process;
-
-        try
-        {
-            process.Start();
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-        }
-        catch (Exception ex)
-        {
-            LogNow($"启动 cntlm 失败：{ex.Message}");
-            lock (_gate)
-            {
-                if (ReferenceEquals(_process, process)) _process = null;
-            }
-            try
-            {
-                process.Dispose();
-            }
-            catch
-            {
-                // 忽略
-            }
-            return;
-        }
-
-        LogNow($"已启动 cntlm 进程（PID={process.Id}）。");
-
-        if (trace)
-        {
-            StartTraceTailer(tracePath, startOffset);
-        }
-        else
-        {
-            LogNow("详细日志未开启（设置 → 运行 → 记录详细日志）；此处只显示 cntlm 的标准输出。");
-        }
-
-        _ = MonitorStartupAsync(process);
+        using var p = Process.Start(psi);
+        if (p == null) return (-1, "无法启动 sc.exe");
+        var stdout = p.StandardOutput.ReadToEndAsync();
+        var stderr = p.StandardError.ReadToEndAsync();
+        p.WaitForExit();
+        Task.WaitAll(stdout, stderr);
+        return (p.ExitCode, stdout.Result + stderr.Result);
     }
 
-    private async Task MonitorStartupAsync(Process process)
+    private CntlmStatus ServiceStatus()
     {
-        var (host, port) = GuiSettings.ParseListen(Settings.Listen);
-        for (var i = 0; i < 20; i++)
-        {
-            await Task.Delay(200).ConfigureAwait(false);
-
-            bool exited;
-            try
-            {
-                exited = process.HasExited;
-            }
-            catch
-            {
-                exited = true;
-            }
-
-            if (exited)
-            {
-                var code = -1;
-                try
-                {
-                    code = process.ExitCode;
-                }
-                catch
-                {
-                    // 忽略
-                }
-                LogNow($"cntlm 进程已退出（退出码 {code}），详情见 Cntlm 日志。");
-                StopTraceTailer();
-                return;
-            }
-
-            if (FindListeningPid(port) is int pid)
-            {
-                LogNow($"cntlm 已启动并在监听 {host}:{port}（PID={pid}）。");
-                return;
-            }
-        }
-
-        LogNow("cntlm 已启动，但暂时未发现监听端口，详情见 Cntlm 日志。");
+        var (_, output) = RunSc("query", _s.ServiceName);
+        var running = output.IndexOf("RUNNING", StringComparison.OrdinalIgnoreCase) >= 0;
+        var detail = $"{_s.ServiceName} 服务 {(running ? "运行中" : "未运行")}";
+        if (PortListenCheck()) detail = "端口已监听 · " + detail;
+        return new CntlmStatus(running, detail);
     }
 
-    public void KillProcess()
+    // ---------------- 进程模式 ----------------
+
+    /// <summary>查找监听指定端口的进程 PID；找不到返回 null。</summary>
+    private static int? FindListenPid(string host, int port)
     {
-        StopTraceTailer();
-
-        var (_, port) = GuiSettings.ParseListen(Settings.Listen);
-        var listeningPid = FindListeningPid(port);
-        if (listeningPid is int pid)
-        {
-            var name = GetProcessName(pid);
-            if (name.Equals("cntlm", StringComparison.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    using var killer = Process.Start(new ProcessStartInfo("taskkill", $"/PID {pid} /F /T")
-                    {
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                    });
-                    killer?.WaitForExit(5000);
-                    LogNow($"已结束占用端口 {port} 的 cntlm 进程（PID={pid}）。");
-                }
-                catch (Exception ex)
-                {
-                    LogNow($"结束 cntlm 进程失败：{ex.Message}");
-                }
-            }
-            else
-            {
-                LogNow($"端口 {port} 被 {(name.Length == 0 ? "未知进程" : name)}（PID={pid}）占用，未结束该进程。");
-            }
-        }
-
-        Process? process;
-        lock (_gate)
-        {
-            process = _process;
-            _process = null;
-        }
-
-        if (process == null) return;
-
         try
         {
-            if (!process.HasExited) process.Kill(true);
+            var psi = new ProcessStartInfo("netstat.exe", "-ano -p tcp")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return null;
+            var output = p.StandardOutput.ReadToEnd();
+            p.WaitForExit(5000);
+
+            var needle = ":" + port + " ";
+            foreach (var line in output.Split('\n'))
+            {
+                if (line.IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (line.IndexOf("LISTENING", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                var tokens = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                if (tokens.Length >= 5 && int.TryParse(tokens[^1], out var pid) && pid > 0)
+                    return pid;
+            }
         }
         catch
         {
-            // 忽略
+            // netstat 失败按“未找到”处理
         }
-        finally
-        {
-            try
-            {
-                process.Dispose();
-            }
-            catch
-            {
-                // 忽略
-            }
-        }
+        return null;
     }
 
-    private void LogNow(string message) => Log?.Invoke(message);
-
-    private static IEnumerable<string> SplitLines(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return Array.Empty<string>();
-        return text.Replace("\r\n", "\n").Split('\n')
-            .Select(line => line.TrimEnd())
-            .Where(line => line.Length > 0);
-    }
-
-    private static bool ProbePort(string host, int port)
+    private static bool IsCntlmProcess(int pid)
     {
         try
         {
-            using var cts = new CancellationTokenSource(1000);
-            using var client = new TcpClient();
-            client.ConnectAsync(host, port, cts.Token).GetAwaiter().GetResult();
-            return client.Connected;
+            using var p = Process.GetProcessById(pid);
+            return p.ProcessName.Equals("cntlm", StringComparison.OrdinalIgnoreCase);
         }
         catch
         {
@@ -450,163 +246,255 @@ public sealed class CntlmController
         }
     }
 
-    private static int? FindListeningPid(int port)
+    private void StartProcess()
     {
-        try
+        KillProcess();
+
+        var (host, port) = GuiSettings.ParseListen(_s.Listen);
+        var ini = EffectiveConfigPath;
+        var trace = GuiSettings.TraceLog;
+        var useTrace = _s.EnableTrace;
+
+        // -T 运行时日志只写入 trace 文件（stdout 拿不到），先清掉旧文件；
+        // 默认不开启，避免长时间运行时文件持续增长
+        long traceStart = 0;
+        if (useTrace)
         {
-            var psi = new ProcessStartInfo("netstat", "-ano -p tcp")
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                CreateNoWindow = true,
-            };
-
-            using var process = Process.Start(psi);
-            if (process == null) return null;
-
-            var output = process.StandardOutput.ReadToEnd();
-            process.WaitForExit(4000);
-
-            foreach (var line in output.Split('\n'))
-            {
-                var parts = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 5) continue;
-                if (!parts[0].Equals("TCP", StringComparison.OrdinalIgnoreCase)) continue;
-                if (!parts[3].Equals("LISTENING", StringComparison.OrdinalIgnoreCase)) continue;
-
-                var local = parts[1];
-                var idx = local.LastIndexOf(':');
-                if (idx < 0) continue;
-                if (!int.TryParse(local[(idx + 1)..], out var localPort) || localPort != port) continue;
-                if (int.TryParse(parts[4], out var pid)) return pid;
-            }
-        }
-        catch
-        {
-            // 忽略
-        }
-
-        return null;
-    }
-
-    private static string GetProcessName(int pid)
-    {
-        try
-        {
-            using var process = Process.GetProcessById(pid);
-            return process.ProcessName;
-        }
-        catch
-        {
-            return "";
-        }
-    }
-
-    private void StartTraceTailer(string path, long startOffset)
-    {
-        StopTraceTailer();
-        var cts = new CancellationTokenSource();
-        var thread = new Thread(() => TailLoop(path, startOffset, cts.Token)) { IsBackground = true };
-        lock (_gate)
-        {
-            _tailCts = cts;
-            _tailThread = thread;
-        }
-        thread.Start();
-    }
-
-    private void StopTraceTailer()
-    {
-        CancellationTokenSource? cts;
-        Thread? thread;
-        lock (_gate)
-        {
-            cts = _tailCts;
-            thread = _tailThread;
-            _tailCts = null;
-            _tailThread = null;
-        }
-
-        try
-        {
-            cts?.Cancel();
-        }
-        catch
-        {
-            // 忽略
-        }
-
-        if (thread != null && thread != Thread.CurrentThread)
-        {
-            try
-            {
-                thread.Join(1500);
-            }
+            try { if (File.Exists(trace)) File.Delete(trace); }
             catch
             {
-                // 忽略
+                try { traceStart = new FileInfo(trace).Length; } catch { }
             }
         }
 
-        cts?.Dispose();
-    }
-
-    private void TailLoop(string path, long position, CancellationToken token)
-    {
-        var pending = "";
-        while (!token.IsCancellationRequested)
+        // -T 必须是第一个参数；-f 前台运行；-c 配置文件
+        var psi = new ProcessStartInfo
         {
-            position = ReadNewTrace(path, position, ref pending);
-            Thread.Sleep(400);
+            FileName = Cmd,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+            WorkingDirectory = Path.GetDirectoryName(Cmd),
+        };
+        if (useTrace)
+        {
+            psi.ArgumentList.Add("-T");
+            psi.ArgumentList.Add(trace);
         }
-
-        // 停止前补读一次
-        ReadNewTrace(path, position, ref pending, flush: true);
-    }
-
-    private long ReadNewTrace(string path, long position, ref string pending, bool flush = false)
-    {
+        psi.ArgumentList.Add("-f");
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add(ini);
+        Log?.Invoke(useTrace
+            ? $"启动: {Cmd} -T \"{trace}\" -f -c \"{ini}\""
+            : $"启动: {Cmd} -f -c \"{ini}\"（未启用详细日志）");
         try
         {
-            if (!File.Exists(path)) return position;
+            _process = Process.Start(psi);
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke("启动失败: " + ex.Message);
+            return;
+        }
 
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            if (stream.Length < position) position = 0;
-            if (stream.Length <= position)
-            {
-                if (flush && pending.Length > 0)
-                {
-                    CntlmLog?.Invoke(pending);
-                    pending = "";
-                }
-                return position;
-            }
+        if (_process == null)
+        {
+            Log?.Invoke("启动失败: 无法创建进程。");
+            return;
+        }
 
-            stream.Seek(position, SeekOrigin.Begin);
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            var chunk = reader.ReadToEnd();
-            position = stream.Position;
+        _process.OutputDataReceived += (_, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) CntlmLog?.Invoke(e.Data); };
+        _process.ErrorDataReceived += (_, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) CntlmLog?.Invoke(e.Data); };
+        _process.BeginOutputReadLine();
+        _process.BeginErrorReadLine();
 
-            var text = pending + chunk;
+        // 启用详细日志时才跟踪 trace 文件
+        if (useTrace)
+        {
+            _tailCts = new CancellationTokenSource();
+            var token = _tailCts.Token;
+            _tailTask = Task.Run(() => TailTraceLoop(trace, traceStart, token));
+        }
+        else
+        {
+            Log?.Invoke("详细日志未开启（设置 → 运行 → 记录详细日志）；此处只显示 cntlm 的标准输出。");
+        }
+
+        // 等待监听端口就绪，判断是否成功起来
+        int? pid = null;
+        for (int waited = 0; waited < ListenWaitMs && !_process.HasExited; waited += ListenPollMs)
+        {
+            Thread.Sleep(ListenPollMs);
+            pid = FindListenPid(host, port);
+            if (pid != null) break;
+        }
+
+        if (_process.HasExited)
+        {
+            Log?.Invoke($"cntlm 提前退出，退出码 {_process.ExitCode}");
+            Thread.Sleep(600); // 给 tailer 一点时间读完最后几行
+            StopTraceTail();
+            _process = null;
+            return;
+        }
+
+        pid ??= FindListenPid(host, port);
+        Log?.Invoke(pid != null
+            ? $"cntlm 已启动 (监听 PID={pid})"
+            : "cntlm 已启动，但暂时未发现监听端口，详情见 Cntlm 日志。");
+    }
+
+    /// <summary>持续跟踪 cntlm 的 trace 日志文件，把新增行转发到 Cntlm 日志。</summary>
+    private void TailTraceLoop(string path, long start, CancellationToken ct)
+    {
+        long pos = start;
+        var leftover = new StringBuilder();
+
+        void ReadPass()
+        {
+            if (!File.Exists(path)) return;
+            // cntlm 持有写句柄，必须以共享方式打开
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (fs.Length < pos) pos = 0; // 文件被重建/清空
+            if (fs.Length <= pos) return;
+            fs.Seek(pos, SeekOrigin.Begin);
+            using var ms = new MemoryStream();
+            fs.CopyTo(ms);
+            pos += ms.Length;
+            var text = leftover.ToString() + Encoding.UTF8.GetString(ms.ToArray());
+            leftover.Clear();
             var lines = text.Replace("\r\n", "\n").Split('\n');
-            pending = lines[^1];
-            for (var i = 0; i < lines.Length - 1; i++)
+            for (int i = 0; i < lines.Length - 1; i++)
             {
                 if (lines[i].Length > 0) CntlmLog?.Invoke(lines[i]);
             }
+            if (lines[^1].Length > 0) leftover.Append(lines[^1]); // 半行留到下一轮
+        }
 
-            if (flush && pending.Length > 0)
+        while (true)
+        {
+            try { ReadPass(); }
+            catch (IOException) { /* cntlm 正在写文件，稍后重试 */ }
+            catch { break; }
+
+            if (ct.WaitHandle.WaitOne(400))
             {
-                CntlmLog?.Invoke(pending);
-                pending = "";
+                try { ReadPass(); } catch { } // 停止前补读一轮，尽量收全最后几行
+                break;
             }
+        }
+    }
+
+    private void StopTraceTail()
+    {
+        try { _tailCts?.Cancel(); } catch { }
+        try { _tailTask?.Wait(1000); } catch { }
+        _tailCts?.Dispose();
+        _tailCts = null;
+        _tailTask = null;
+    }
+
+    private void KillProcess()
+    {
+        StopTraceTail();
+        var (host, port) = GuiSettings.ParseListen(_s.Listen);
+        var listener = FindListenPid(host, port);
+        if (listener != null && IsCntlmProcess(listener.Value))
+        {
+            Log?.Invoke($"结束监听进程 PID={listener}");
+            RunCmd("taskkill", $"/PID {listener} /F /T");
+        }
+        else if (listener != null)
+        {
+            Log?.Invoke($"端口 {port} 被其它进程占用（PID={listener}），未结束该进程。");
+        }
+
+        if (_process != null)
+        {
+            if (!_process.HasExited)
+            {
+                try { _process.Kill(entireProcessTree: true); } catch { }
+            }
+            _process.Dispose();
+            _process = null;
+        }
+    }
+
+    /// <summary>程序退出时调用：进程模式强杀子进程，服务模式无需处理（服务由系统托管）。</summary>
+    public void StopOnExit()
+    {
+        if (Mode == EngineMode.Process) KillProcess();
+    }
+
+    private void RunCmd(string file, string args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(file, args)
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return;
+            var stdout = p.StandardOutput.ReadToEndAsync();
+            var stderr = p.StandardError.ReadToEndAsync();
+            p.WaitForExit();
+            Task.WaitAll(stdout, stderr);
+            var output = (stdout.Result + stderr.Result).Trim();
+            if (output.Length > 0) Log?.Invoke(output);
+        }
+        catch (Exception ex)
+        {
+            Log?.Invoke($"{file} 执行失败: {ex.Message}");
+        }
+    }
+
+    // ---------------- 状态 ----------------
+
+    public CntlmStatus GetStatus() =>
+        Mode == EngineMode.Service ? ServiceStatus() : ProcessStatus();
+
+    private CntlmStatus ProcessStatus()
+    {
+        var (host, port) = GuiSettings.ParseListen(_s.Listen);
+        var listening = PortListenCheck();
+
+        // GetStatus 可能在后台线程被调用，与 KillProcess 的 Dispose 并发，
+        // HasExited 在已释放的进程对象上会抛异常，这里兜底
+        Process? own = _process;
+        bool ownAlive;
+        try { ownAlive = own != null && !own.HasExited; }
+        catch { ownAlive = false; }
+
+        if (!listening && !ownAlive) return new CntlmStatus(false, "未运行");
+
+        var listenShown = $"{host}:{port}";
+        if (!listening) return new CntlmStatus(true, "宿主进程存活但尚未检测到监听端口");
+
+        int? pid = null;
+        try { if (ownAlive) pid = own!.Id; } catch { }
+        return new CntlmStatus(true, pid != null
+            ? $"运行中 · 监听 {listenShown} · PID={pid}"
+            : $"运行中 · 监听 {listenShown}");
+    }
+
+    /// <summary>快速检查监听端口是否可连接（不启动外部进程）。</summary>
+    private bool PortListenCheck()
+    {
+        var (host, port) = GuiSettings.ParseListen(_s.Listen);
+        try
+        {
+            using var c = new TcpClient();
+            c.ConnectAsync(host, port).WaitAsync(TimeSpan.FromMilliseconds(1000)).GetAwaiter().GetResult();
+            return c.Connected;
         }
         catch
         {
-            // 文件被占用/删除时忽略，下一轮重试
+            return false;
         }
-
-        return position;
     }
 }

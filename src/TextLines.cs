@@ -1,20 +1,27 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
 namespace CntlmGUI;
 
-internal static class TextLines
+/// <summary>
+/// 配置里大量使用“每行一条”的文本格式，这里统一拆分规则：
+/// 去掉行尾 \r、首尾空白，忽略空行。
+/// </summary>
+public static class TextLines
 {
-    public static string[] Split(string? text)
+    public static List<string> Split(string? text)
     {
-        if (string.IsNullOrWhiteSpace(text)) return Array.Empty<string>();
-        return text
-            .Replace("\r\n", "\n")
-            .Replace('\r', '\n')
-            .Split('\n')
-            .Select(line => line.Trim())
-            .Where(line => line.Length > 0)
-            .ToArray();
+        var list = new List<string>();
+        if (string.IsNullOrWhiteSpace(text)) return list;
+        foreach (var line in text.Split('\n'))
+        {
+            var t = line.Trim('\r', ' ', '\t');
+            if (t.Length > 0) list.Add(t);
+        }
+        return list;
     }
 
-    public static string Join(IEnumerable<string> lines) => string.Join("\r\n", lines);
-
-    public static string JoinComma(string? text) => string.Join(", ", Split(text));
+    public static bool AnyNonEmpty(params string?[] values) =>
+        values.Any(v => !string.IsNullOrWhiteSpace(v));
 }

@@ -1,72 +1,60 @@
+using System;
 using System.Diagnostics.CodeAnalysis;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Windows.Forms;
 
 namespace CntlmGUI;
 
-/// <summary>
-/// 左侧文字 + 右侧 44×22 圆角开关。点击文字或控件本身都会切换状态。
-/// </summary>
+/// <summary>左边文字（真实 Label 渲染，与其它 Label 完全一致）+ 右侧滑动开关。</summary>
 public sealed class ToggleSwitch : Control
 {
-    private const int TrackWidth = 44;
-    private const int TrackHeight = 22;
-    private const int TrackGap = 8;
-
-    private readonly Label _label;
-    private string _text = "";
+    private readonly Label _text;
     private bool _checked;
 
     public ToggleSwitch()
     {
-        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
-                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
-        Height = 30;
-        MinimumSize = new Size(140, 30);
-        BackColor = Color.Transparent;
-        Cursor = Cursors.Hand;
-
-        _label = new Label
+        _text = new Label
         {
             AutoSize = false,
-            BackColor = Color.Transparent,
-            ForeColor = AppTheme.Text,
-            Font = AppTheme.Ui,
+            Height = 30,
             TextAlign = ContentAlignment.MiddleLeft,
             AutoEllipsis = true,
-            Cursor = Cursors.Hand,
+            Margin = new Padding(0),
+            // 注意：不能写 ForeColor = base.ForeColor，那会经过 override 的
+            // ForeColor getter（访问尚未赋值的 _text），导致 NullReferenceException。
+            ForeColor = DefaultForeColor,
         };
-        _label.Click += (_, _) => Checked = !Checked;
-        Controls.Add(_label);
-        LayoutChildren();
+        Controls.Add(_text);
+        _text.Click += (_, _) => Toggle();
 
-        Click += (_, _) => Checked = !Checked;
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer, true);
+        Cursor = Cursors.Hand;
+        Height = 30;
+        base.Font = AppTheme.Ui;
+        _text.Font = AppTheme.Ui;
     }
-
-    public event EventHandler? CheckedChanged;
 
     [AllowNull]
     public override string Text
     {
-        get => _text;
-        set
-        {
-            var value2 = value ?? "";
-            if (_text == value2) return;
-            _text = value2;
-            if (_label != null) _label.Text = value2;
-            Invalidate();
-        }
+        get => _text.Text;
+        set { _text.Text = value; Invalidate(); }
     }
 
+    [AllowNull]
+    public override Font Font
+    {
+        get => _text.Font;
+        set { _text.Font = value; base.Font = value; Invalidate(); }
+    }
+
+    [AllowNull]
     public override Color ForeColor
     {
-        get => base.ForeColor;
-        set
-        {
-            base.ForeColor = value;
-            if (_label != null) _label.ForeColor = value;
-        }
+        get => _text.ForeColor;
+        set { _text.ForeColor = value; base.ForeColor = value; Invalidate(); }
     }
 
     public bool Checked
@@ -81,49 +69,47 @@ public sealed class ToggleSwitch : Control
         }
     }
 
-    protected override void OnFontChanged(EventArgs e)
+    public event EventHandler? CheckedChanged;
+
+    protected override void OnClick(EventArgs e)
     {
-        base.OnFontChanged(e);
-        if (_label != null) _label.Font = Font;
-        LayoutChildren();
+        base.OnClick(e);
+        Toggle();
     }
 
-    protected override void OnEnabledChanged(EventArgs e)
-    {
-        base.OnEnabledChanged(e);
-        if (_label != null) _label.ForeColor = Enabled ? ForeColor : AppTheme.Muted;
-        Invalidate();
-    }
-
-    protected override void OnSizeChanged(EventArgs e)
-    {
-        base.OnSizeChanged(e);
-        LayoutChildren();
-    }
+    private void Toggle() => Checked = !Checked;
 
     protected override void OnPaint(PaintEventArgs e)
     {
+        base.OnPaint(e);
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
 
-        var track = TrackBounds;
-        using var path = AppTheme.RoundedRect(track, TrackHeight / 2);
-        using var brush = new SolidBrush(_checked ? AppTheme.Accent : Color.FromArgb(180, 180, 180));
-        g.FillPath(brush, path);
+        const int trackW = 44, trackH = 22, gap = 20;
+        int trackX = Width - trackW - 2;
+        int textW = Math.Max(0, trackX - gap);
+        _text.SetBounds(0, (Height - 30) / 2, textW, 30);
 
-        int knobSize = TrackHeight - 4;
-        int knobX = _checked ? track.Right - knobSize - 2 : track.Left + 2;
-        using var knobBrush = new SolidBrush(Color.White);
-        g.FillEllipse(knobBrush, knobX, track.Top + 2, knobSize, knobSize);
+        int trackY = (Height - trackH) / 2;
+        var track = new Rectangle(trackX, trackY, trackW, trackH);
+        using (var path = new GraphicsPath())
+        {
+            path.AddArc(track.X, track.Y, trackH, trackH, 90, 180);
+            path.AddArc(track.Right - trackH, track.Y, trackH, trackH, 270, 180);
+            path.CloseFigure();
+            using var brush = new SolidBrush(_checked ? AppTheme.Accent : Color.FromArgb(180, 180, 180));
+            g.FillPath(brush, path);
+        }
+
+        int knob = trackH - 6;
+        int knobX = _checked ? track.Right - knob - 3 : track.X + 3;
+        using (var knobBrush = new SolidBrush(Color.White))
+            g.FillEllipse(knobBrush, knobX, track.Y + 3, knob, knob);
     }
 
-    private Rectangle TrackBounds =>
-        new(Width - TrackWidth - 1, (Height - TrackHeight) / 2, TrackWidth, TrackHeight);
-
-    private void LayoutChildren()
+    protected override void OnResize(EventArgs eventargs)
     {
-        if (_label == null) return;
-        int labelWidth = Math.Max(0, Width - TrackWidth - TrackGap);
-        _label.SetBounds(0, 0, labelWidth, Height);
+        base.OnResize(eventargs);
+        MinimumSize = new Size(140, 30);
     }
 }

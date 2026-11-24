@@ -1,353 +1,573 @@
+using System;
+using System.Collections.Generic;
 using System.Drawing;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
 using CntlmGUI.Models;
 using CntlmGUI.Services;
 
 namespace CntlmGUI;
 
-public sealed class ProxySpeedForm : Form
+/// <summary>
+/// 多候选二级代理测速：顶部配置目标与吞吐参数，中部结果列表逐条回填。
+/// 增删/排序通过按钮与右键菜单完成，支持中途取消；关闭窗口会先取消正在进行的测速。
+/// </summary>
+public class ProxySpeedForm : Form
 {
-    private readonly GuiSettings _settings;
-    private readonly ProxyResultList _list;
-    private readonly TextBox _urlBox;
-    private readonly TextBox _sizeBox;
-    private readonly TextBox _timeoutBox;
-    private readonly Button _speedButton;
-    private readonly Button _upButton;
-    private readonly Button _downButton;
-    private readonly Button _topButton;
-    private readonly System.Windows.Forms.Timer _dotsTimer = new() { Interval = 300 };
-    private readonly ToolTip _toolTip = new();
-    private readonly List<ProxyBench> _results = new();
+    private const int StatusTitleMax = 60;
 
-    private CancellationTokenSource? _cts;
+    private readonly GuiSettings _s;
+    private readonly ProxySpeedTest _tester;
+    private readonly System.Windows.Forms.Timer _animTimer = new() { Interval = 300 };
+    private readonly HashSet<string> _pending = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ToolTip _tip = new();
+
+    private TextBox _targetUrl = null!;
+    private NumericUpDown _probeMb = null!, _probeTimeout = null!;
+    private Button _btnRun = null!, _btnSetFirst = null!, _btnUp = null!, _btnDown = null!;
+    private ProxyResultList _list = null!;
+
     private bool _running;
-    private bool _closeAfterTest;
-    private bool _closeReady;
-    private int _dotFrame;
+    private bool _closeAfterRun;
+    private Task? _runTask;
+    private List<ProxyBench> _last;
+    private int _animPhase;
+    private CancellationTokenSource? _cts;
+    private int _editRowIndex = -1;  // 允许就地编辑的行索引；-1 表示当前不允许
 
-    public ProxySpeedForm(GuiSettings settings)
+    public ProxySpeedForm(GuiSettings s)
     {
-        _settings = settings;
+        _s = s;
+        _tester = new ProxySpeedTest(s);
+        _animTimer.Tick += (_, _) => AnimatePending();
+        _last = s.LastBench.ToList();
 
         Text = "代理列表";
-        Font = AppTheme.Ui;
-        BackColor = Color.White;
+        StartPosition = FormStartPosition.CenterParent;
         ClientSize = new Size(900, 600);
+        MinimumSize = new Size(900, 600);
+        MaximumSize = new Size(900, 600);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
-        MinimizeBox = false;
-        StartPosition = FormStartPosition.CenterParent;
-        MinimumSize = Size;
-        MaximumSize = Size;
+        Font = AppTheme.Ui;
+        BackColor = Color.White;
 
-        var toolbar = new Panel { Location = new Point(0, 0), Size = new Size(900, 96), BackColor = Color.White };
-        toolbar.Paint += (_, e) =>
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12), RowCount = 3, ColumnCount = 1 };
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+        root.Controls.Add(BuildButtonRow(), 0, 0);
+        root.Controls.Add(BuildProbeRow(), 0, 1);
+
+        _list = new ProxyResultList();
+        _list.SelectedIndexChanged += (_, _) => UpdateButtons();
+        _list.KeyDown += (_, e) =>
         {
-            using var pen = new Pen(AppTheme.Line);
-            e.Graphics.DrawLine(pen, 0, toolbar.Height - 1, toolbar.Width, toolbar.Height - 1);
+            if (e.KeyCode == Keys.Delete) DeleteSelected();
+            else if (e.KeyCode == Keys.F2) StartInlineEdit();
         };
-        Controls.Add(toolbar);
-
-        _list = new ProxyResultList(_settings)
+        _list.DoubleClick += (_, _) => OnListDoubleClick();
+        _list.BeforeLabelEdit += (_, e) =>
         {
-            Location = new Point(12, 104),
-            Size = new Size(876, 484),
-            Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+            if (!_list.IsAddRow(e.Item) && e.Item != _editRowIndex) e.CancelEdit = true;
         };
-        _list.SelectionChanged += (_, _) => UpdateButtons();
-        _list.OrderChanged += (_, _) => UpdateButtons();
-        Controls.Add(_list);
+        _list.AfterLabelEdit += OnAfterLabelEdit;
+        _list.ContextMenuStrip = BuildMenu();
+        root.Controls.Add(_list, 0, 2);
 
-        _speedButton = AppTheme.CreateButton("测速并重排", true);
-        _speedButton.AutoSize = false;
-        _speedButton.Size = new Size(112, 34);
-        _speedButton.Location = new Point(12, 10);
-        _speedButton.Click += OnSpeedClick;
-        toolbar.Controls.Add(_speedButton);
+        Controls.Add(root);
+        LoadCandidates();
+    }
 
-        _upButton = CreateActionButton("上移", 132);
-        _upButton.Click += (_, _) => _list.MoveUp();
-        toolbar.Controls.Add(_upButton);
+    // ---------------- 界面 ----------------
 
-        _downButton = CreateActionButton("下移", 212);
-        _downButton.Click += (_, _) => _list.MoveDown();
-        toolbar.Controls.Add(_downButton);
-
-        _topButton = CreateActionButton("置顶", 292);
-        _topButton.Click += (_, _) => _list.MoveToTop();
-        toolbar.Controls.Add(_topButton);
-
-        var urlLabel = new Label
+    private Control BuildButtonRow()
+    {
+        var row = new FlowLayoutPanel
         {
-            Text = "目标 URL",
-            Font = AppTheme.Ui,
-            ForeColor = AppTheme.Text,
-            Location = new Point(14, 60),
-            Size = new Size(68, 20),
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            WrapContents = false,
+            Margin = new Padding(0, 0, 0, 8),
         };
-        toolbar.Controls.Add(urlLabel);
 
-        _urlBox = new TextBox
+        _btnRun = new Button { Text = "测速并重排", AutoSize = true };
+        AppTheme.StyleButton(_btnRun);
+        _btnRun.Click += (_, _) => { if (_running) CancelAsync(); else _runTask = RunAndSortAsync(); };
+        _tip.SetToolTip(_btnRun, "顺序测试每个代理，完成后按吞吐重排代理顺序并保存。");
+
+        _btnUp = new Button { Text = "上移", AutoSize = true };
+        AppTheme.StyleButton(_btnUp);
+        _btnUp.Click += (_, _) => MoveSelected(-1);
+
+        _btnDown = new Button { Text = "下移", AutoSize = true };
+        AppTheme.StyleButton(_btnDown);
+        _btnDown.Click += (_, _) => MoveSelected(+1);
+
+        _btnSetFirst = new Button { Text = "置顶", AutoSize = true };
+        AppTheme.StyleButton(_btnSetFirst);
+        _btnSetFirst.Click += (_, _) => SetFirst();
+
+        _btnUp.Enabled = _btnDown.Enabled = _btnSetFirst.Enabled = false;
+        row.Controls.AddRange(new Control[] { _btnRun, _btnUp, _btnDown, _btnSetFirst });
+        return row;
+    }
+
+    private Control BuildProbeRow()
+    {
+        // 用 TableLayoutPanel 按比例分配宽度，避免 FlowLayoutPanel 的首选宽度把整窗撑宽
+        var row = new TableLayoutPanel
         {
-            Font = AppTheme.Ui,
-            BorderStyle = BorderStyle.FixedSingle,
-            Location = new Point(84, 57),
-            Size = new Size(520, 23),
-            Text = string.IsNullOrWhiteSpace(settings.SpeedTestUrl) ? "https://www.google.com" : settings.SpeedTestUrl,
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            ColumnCount = 6,
+            Margin = new Padding(0, 0, 0, 8),
         };
-        toolbar.Controls.Add(_urlBox);
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        for (int i = 0; i < 4; i++) row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
 
-        var sizeLabel = new Label
+        row.Controls.Add(FieldLabel("目标:"), 0, 0);
+        _targetUrl = new TextBox
         {
-            Text = "大小(MB)",
-            Font = AppTheme.Ui,
-            ForeColor = AppTheme.Text,
-            Location = new Point(616, 60),
-            Size = new Size(62, 20),
+            Text = _s.SpeedTestUrl,
+            Dock = DockStyle.Fill,
+            Margin = new Padding(0, 3, 10, 3),
         };
-        toolbar.Controls.Add(sizeLabel);
+        row.Controls.Add(_targetUrl, 1, 0);
 
-        _sizeBox = new TextBox
+        row.Controls.Add(FieldLabel("大小(MB):"), 2, 0);
+        _probeMb = new NumericUpDown
         {
-            Font = AppTheme.Ui,
-            BorderStyle = BorderStyle.FixedSingle,
-            Location = new Point(680, 57),
-            Size = new Size(46, 23),
-            Text = Math.Clamp(settings.SpeedTestMb, 1, 200).ToString(),
+            Minimum = 1,
+            Maximum = 200,
+            Value = Math.Clamp(_s.SpeedTestMb, 1, 200),
+            Width = 60,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 12, 3),
         };
-        toolbar.Controls.Add(_sizeBox);
+        row.Controls.Add(_probeMb, 3, 0);
 
-        var timeoutLabel = new Label
+        row.Controls.Add(FieldLabel("超时(s):"), 4, 0);
+        _probeTimeout = new NumericUpDown
         {
-            Text = "超时(s)",
-            Font = AppTheme.Ui,
-            ForeColor = AppTheme.Text,
-            Location = new Point(738, 60),
-            Size = new Size(54, 20),
+            Minimum = 3,
+            Maximum = 300,
+            Value = Math.Clamp(_s.SpeedTestTimeoutSec, 3, 300),
+            Width = 60,
+            Anchor = AnchorStyles.Left,
+            Margin = new Padding(0, 3, 0, 3),
         };
-        toolbar.Controls.Add(timeoutLabel);
+        row.Controls.Add(_probeTimeout, 5, 0);
 
-        _timeoutBox = new TextBox
+        var tip = new ToolTip();
+        tip.SetToolTip(_targetUrl, "测试目标地址；整链与吞吐测试共用该地址。");
+        tip.SetToolTip(_probeMb, "每个代理最多下载的兆字节数（Range 限制）。");
+        tip.SetToolTip(_probeTimeout, "单个代理的吞吐测试时限；到达时限即停止，按已下载部分计算速度。");
+        return row;
+    }
+
+    private static Label FieldLabel(string text) => new()
+    {
+        Text = text,
+        AutoSize = false,
+        Dock = DockStyle.Fill,
+        TextAlign = ContentAlignment.MiddleLeft,
+        Margin = new Padding(0, 0, 4, 0),
+    };
+
+    private ContextMenuStrip BuildMenu()
+    {
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("添加代理…", null, (_, _) => AddProxyDialog());
+        menu.Items.Add("编辑选中", null, (_, _) => StartInlineEdit());
+        menu.Items.Add("删除选中", null, (_, _) => DeleteSelected());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("上移", null, (_, _) => MoveSelected(-1));
+        menu.Items.Add("下移", null, (_, _) => MoveSelected(+1));
+        menu.Items.Add("设为第一顺位", null, (_, _) => SetFirst());
+        return menu;
+    }
+
+    // ---------------- 就地编辑 ----------------
+
+    private void StartInlineEdit()
+    {
+        if (_running || _list.SelectedItems.Count != 1) return;
+        var item = _list.SelectedItems[0];
+        if (_list.IsAddRow(item.Index)) return;
+        _editRowIndex = item.Index;
+        item.BeginEdit();
+    }
+
+    private void OnAfterLabelEdit(object? sender, LabelEditEventArgs e)
+    {
+        int row = e.Item;
+        bool addRow = _list.IsAddRow(row);
+        if (!addRow && row != _editRowIndex)
         {
-            Font = AppTheme.Ui,
-            BorderStyle = BorderStyle.FixedSingle,
-            Location = new Point(794, 57),
-            Size = new Size(46, 23),
-            Text = Math.Clamp(settings.SpeedTestTimeoutSec, 3, 300).ToString(),
-        };
-        toolbar.Controls.Add(_timeoutBox);
+            e.CancelEdit = true;
+            return;
+        }
 
-        var toolTip = _toolTip;
-        toolTip.SetToolTip(_urlBox, "通过代理访问的目标地址（缺省协议时自动补 https://）");
-        toolTip.SetToolTip(_sizeBox, "吞吐测试下载上限，1–200 MB");
-        toolTip.SetToolTip(_timeoutBox, "吞吐测试时限，3–300 秒");
+        var text = (e.Label ?? "").Trim();
+        if (text.Length == 0)
+        {
+            e.CancelEdit = true;
+            _editRowIndex = -1;
+            if (addRow) _list.RestoreAddHint(row);
+            return;
+        }
 
-        _dotsTimer.Tick += OnDotsTick;
+        e.CancelEdit = true;
+        _editRowIndex = -1;
+        if (addRow) AddProxyEntry(text);
+        else RenameRow(row, text);
+    }
 
+    /// <summary>把第 row 行的代理地址改为 newText，同步 Proxy 列表与既测结果。</summary>
+    private void RenameRow(int row, string newText)
+    {
+        var oldText = _list.Items[row].Tag as string;
+        if (string.IsNullOrEmpty(oldText) || oldText == newText) return;
+
+        var lines = TextLines.Split(_s.ProxyList);
+        for (int i = 0; i < lines.Count; i++)
+            if (lines[i] == oldText) { lines[i] = newText; break; }
+        _s.ProxyList = string.Join("\r\n", lines);
+
+        // 同步对应的测速结果，保留已有成绩
+        for (int i = 0; i < _last.Count; i++)
+            if (_last[i].Line == oldText)
+                _last[i] = _last[i] with { Line = newText };
+        PersistBench();
+
+        var item = _list.Items[row];
+        item.Text = newText;
+        item.Tag = newText;
+        SetStatus($"已将 {oldText} 改为 {newText}。代理重启后生效。");
+    }
+
+    /// <summary>双击：占位行进入“添加”，已有行进入“就地编辑”（延迟到双击事件处理完，避免编辑器被第二次点击吃掉焦点）。</summary>
+    private void OnListDoubleClick()
+    {
+        if (_running) return;
+        var item = _list.FocusedItem ?? (_list.Items.Count > 0 ? _list.Items[^1] : null);
+        if (item == null) return;
+
+        if (_list.IsAddRow(item.Index))
+        {
+            item.SubItems[0].Text = "";
+            item.BeginEdit();
+            return;
+        }
+
+        _editRowIndex = item.Index;
+        BeginInvoke(new Action(() =>
+        {
+            if (_editRowIndex >= 0 && _editRowIndex < _list.Items.Count)
+                _list.Items[_editRowIndex].BeginEdit();
+        }));
+    }
+
+    // ---------------- 列表内容 ----------------
+
+    private void LoadCandidates()
+    {
+        var map = _last
+            .GroupBy(b => b.Line, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.OrdinalIgnoreCase);
+        _list.ShowCandidates(TextLines.Split(_s.ProxyList), map);
         UpdateButtons();
     }
 
-    private static Button CreateActionButton(string text, int x)
+    private void PersistBench()
     {
-        var button = AppTheme.CreateButton(text);
-        button.AutoSize = false;
-        button.Size = new Size(72, 34);
-        button.Location = new Point(x, 10);
-        return button;
+        var alive = TextLines.Split(_s.ProxyList).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        _last.RemoveAll(b => !alive.Contains(b.Line));
+        _s.LastBench = _last.ToList();
+        _s.Save();
     }
 
-    protected override void OnFormClosing(FormClosingEventArgs e)
+    /// <summary>状态显示在窗口标题上，不额外占用界面空间。</summary>
+    private void SetStatus(string text)
     {
-        if (_running && !_closeReady)
+        if (string.IsNullOrWhiteSpace(text))
         {
-            e.Cancel = true;
-            _closeAfterTest = true;
-            SetStatus("正在停止测速…");
-            try
-            {
-                _cts?.Cancel();
-            }
-            catch
-            {
-                // 忽略
-            }
+            Text = "代理列表";
+            return;
+        }
+        if (text.Length > StatusTitleMax) text = text[..StatusTitleMax] + "…";
+        Text = "代理列表 - " + text;
+    }
+
+    /// <summary>测速期间，未完成的行在“说明”列显示循环的“测速中...”。</summary>
+    private void AnimatePending()
+    {
+        if (_pending.Count == 0) return;
+        _animPhase = _animPhase % 3 + 1;
+        _list.AnimatePending(_pending, _animPhase);
+    }
+
+    // ---------------- 增删 / 排序 ----------------
+
+    private void AddProxyDialog()
+    {
+        using var dlg = new Form
+        {
+            Text = "添加代理",
+            StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(360, 140),
+            Font = AppTheme.Ui,
+            BackColor = Color.White,
+            FormBorderStyle = FormBorderStyle.FixedDialog,
+            MaximizeBox = false,
+            MinimizeBox = false,
+        };
+        var box = new TextBox { Left = 12, Top = 12, Width = 336 };
+        var hint = new Label { Text = "格式: IP:端口，可一次输入多个（每行一个）", Left = 12, Top = 40, AutoSize = true, ForeColor = AppTheme.Muted };
+        var ok = new Button { Text = "添加", Left = 286, Top = 100, Width = 64, Height = 30 };
+        AppTheme.StyleButton(ok, primary: true);
+        ok.DialogResult = DialogResult.OK;
+        dlg.Controls.Add(box);
+        dlg.Controls.Add(hint);
+        dlg.Controls.Add(ok);
+        dlg.AcceptButton = ok;
+        if (dlg.ShowDialog(this) != DialogResult.OK) return;
+        AddProxyEntry(box.Text);
+    }
+
+    private void AddProxyEntry(string text)
+    {
+        var items = TextLines.Split(text);
+        if (items.Count == 0) return;
+
+        var merged = TextLines.Split(_s.ProxyList);
+        var seen = merged.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        int added = 0;
+        foreach (var item in items)
+            if (seen.Add(item)) { merged.Add(item); added++; }
+
+        _s.ProxyList = string.Join("\r\n", merged);
+        PersistBench();
+        LoadCandidates();
+        SetStatus(added > 0 ? $"已添加 {added} 个，点“测速”开始测试。" : "重复的代理已跳过。");
+    }
+
+    private void DeleteSelected()
+    {
+        if (_running || _list.SelectedItems.Count == 0) return;
+        var remove = _list.SelectedItems.Cast<ListViewItem>()
+            .Select(it => it.Tag as string)
+            .Where(t => t != null)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (remove.Count == 0) return;
+
+        var lines = TextLines.Split(_s.ProxyList).Where(l => !remove.Contains(l)).ToList();
+        _s.ProxyList = string.Join("\r\n", lines);
+        _last.RemoveAll(b => remove.Contains(b.Line));
+        PersistBench();
+        LoadCandidates();
+        SetStatus($"已删除 {remove.Count} 个代理。");
+    }
+
+    private void MoveSelected(int delta)
+    {
+        if (_running || _list.SelectedItems.Count == 0) return;
+        int from = _list.SelectedItems[0].Index;
+        var lines = TextLines.Split(_s.ProxyList);
+        int to = from + delta;
+        if (to < 0 || to >= lines.Count) return;
+
+        (lines[from], lines[to]) = (lines[to], lines[from]);
+        _s.ProxyList = string.Join("\r\n", lines);
+        _s.Save();
+        LoadCandidates();
+        if (to < _list.Items.Count) _list.Items[to].Selected = true;
+        SetStatus("已调整顺序（无需重新测速）。");
+    }
+
+    /// <summary>把选中行置为 Proxy 列表第一行（cntlm 将优先使用第一个可用的）。</summary>
+    private void SetFirst()
+    {
+        if (_running || _list.SelectedItems.Count == 0) return;
+        var pick = _list.SelectedItems[0].Tag as string;
+        if (pick == null) return;
+
+        var lines = TextLines.Split(_s.ProxyList);
+        lines.Remove(pick);
+        lines.Insert(0, pick);
+        _s.ProxyList = string.Join("\r\n", lines);
+        _s.Save();
+        LoadCandidates();
+        if (_list.Items.Count > 0) _list.Items[0].Selected = true;
+        SetStatus($"已将 {pick} 设为第一顺位。代理重启后生效。");
+    }
+
+    // ---------------- 测速 ----------------
+
+    private void CancelAsync()
+    {
+        try { _cts?.Cancel(); } catch { }
+        SetStatus("正在停止…");
+    }
+
+    private async Task RunAndSortAsync()
+    {
+        if (_running) return;
+
+        var target = _targetUrl.Text.Trim();
+        if (target.Length == 0)
+        {
+            MessageBox.Show(this, "请填写测试 URL", "代理测速", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (!_tester.Ready)
+        {
+            MessageBox.Show(this, "未找到 cntlm.exe，无法进行整链实测。请先在设置中指定可执行文件。",
+                "代理测速", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
         }
 
-        base.OnFormClosing(e);
+        int probeMb = (int)_probeMb.Value;
+        int probeTimeout = (int)_probeTimeout.Value;
+        _s.SpeedTestUrl = ProxySpeedTest.NormalizeUrl(target);
+        _s.SpeedTestMb = probeMb;
+        _s.SpeedTestTimeoutSec = probeTimeout;
+        _s.Save();
+
+        var lines = TextLines.Split(_s.ProxyList);
+        if (lines.Count == 0)
+        {
+            SetStatus("代理列表为空，右键列表添加代理。");
+            return;
+        }
+
+        _running = true;
+        UpdateButtons();
+        _list.ShowPending(lines);
+        _pending.Clear();
+        foreach (var line in lines) _pending.Add(line);
+        _animPhase = 0;
+        _animTimer.Start();
+        AnimatePending();
+        SetStatus($"顺序测速中…（每个代理最多 {probeMb}MB / {probeTimeout}s）");
+
+        var progress = new Progress<ProxyBench>(OnBenchResult);
+        _cts = new CancellationTokenSource();
+        try
+        {
+            _last = await _tester.BenchAsync(target, target,
+                probeMb * 1024L * 1024L, probeTimeout, progress, _cts.Token);
+
+            // 排序：整链可用 → 吞吐有效 → 下载速度 → 首字节 → TCP
+            var ordered = _last
+                .OrderByDescending(b => b.RelayOk)
+                .ThenByDescending(b => b.SpeedTested && b.SpeedOk)
+                .ThenByDescending(b => b.SpeedTested ? b.SpeedBps : long.MinValue)
+                .ThenBy(b => b.RelayOk ? b.RelayMs : int.MaxValue)
+                .ThenBy(b => b.TcpMs)
+                .Select(b => b.Line)
+                .ToList();
+            foreach (var line in TextLines.Split(_s.ProxyList))
+                if (!ordered.Contains(line)) ordered.Add(line);
+
+            _s.ProxyList = string.Join("\r\n", ordered);
+            LoadCandidates();
+            PersistBench();
+
+            var usable = _last.Count(b => b.RelayOk);
+            var measured = _last.Count(b => b.SpeedTested && b.SpeedOk);
+            SetStatus($"完成：{_last.Count} 个候选，{usable} 个整链可用，{measured} 个吞吐有效；已按结果重排并保存。");
+        }
+        catch (OperationCanceledException)
+        {
+            // 取消：保留已经测出的部分结果，未测的行回到“待测”
+            LoadCandidates();
+            PersistBench();
+            SetStatus("已取消。");
+        }
+        catch (Exception ex)
+        {
+            SetStatus("测速失败: " + ex.Message);
+        }
+        finally
+        {
+            _running = false;
+            _animTimer.Stop();
+            _pending.Clear();
+            _cts?.Dispose();
+            _cts = null;
+            UpdateButtons();
+        }
+    }
+
+    private void OnBenchResult(ProxyBench b)
+    {
+        _pending.Remove(b.Line);
+        if (_pending.Count == 0) _animTimer.Stop();
+
+        var idx = _last.FindIndex(x => string.Equals(x.Line, b.Line, StringComparison.OrdinalIgnoreCase));
+        if (idx >= 0) _last[idx] = b;
+        else _last.Add(b);
+
+        _list.UpdateRow(b);
     }
 
     private void UpdateButtons()
     {
-        _speedButton.Text = _running ? "停止" : "测速并重排";
-        _speedButton.Enabled = _running || _list.Proxies.Count > 0;
-        _upButton.Enabled = !_running && _list.CanMoveUp;
-        _downButton.Enabled = !_running && _list.CanMoveDown;
-        _topButton.Enabled = !_running && _list.CanMoveTop;
+        int count = _list.Items.Count;
+        int realCount = count - (count > 0 && _list.IsAddRow(count - 1) ? 1 : 0);
+        int selected = _list.SelectedIndices.Count;
+        int selIdx = selected == 1 ? _list.SelectedIndices[0] : -1;
+        bool selIsAdd = _list.IsAddRow(selIdx);
+
+        _btnRun.Text = _running ? "停止" : "测速并重排";
+        _btnRun.Enabled = _running || realCount > 0;
+        _btnUp.Enabled = !_running && selected == 1 && !selIsAdd && selIdx > 0;
+        _btnDown.Enabled = !_running && selected == 1 && !selIsAdd && selIdx < realCount - 1;
+        _btnSetFirst.Enabled = !_running && selected == 1 && !selIsAdd;
     }
 
-    private void SetStatus(string? status)
-    {
-        var title = "代理列表";
-        if (!string.IsNullOrEmpty(status))
-        {
-            var combined = title + " - " + status;
-            if (combined.Length > 60) combined = combined[..59] + "…";
-            Text = combined;
-        }
-        else
-        {
-            Text = title;
-        }
-    }
+    // ---------------- 生命周期 ----------------
 
-    private async void OnSpeedClick(object? sender, EventArgs e)
+    protected override void OnFormClosing(FormClosingEventArgs e)
     {
-        if (_running)
+        // 测速中关窗：先取消并等测试进程退出，避免留下后台 cntlm
+        if (_running && !_closeAfterRun)
         {
-            SetStatus("正在停止测速…");
-            try
-            {
-                _cts?.Cancel();
-            }
-            catch
-            {
-                // 忽略
-            }
+            e.Cancel = true;
+            _closeAfterRun = true;
+            CancelAsync();
+            _ = CloseWhenIdleAsync();
             return;
         }
-
-        var proxies = _list.Proxies.ToList();
-        if (proxies.Count == 0)
-        {
-            SetStatus("没有可测速的代理。");
-            return;
-        }
-
-        var url = ProxySpeedTest.NormalizeUrl(_urlBox.Text);
-        if (url.Length == 0)
-        {
-            MessageBox.Show(this, "请填写目标 URL。", "代理列表",
-                MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            return;
-        }
-
-        var mb = ClampInt(_sizeBox.Text, 1, 200, 10);
-        var timeout = ClampInt(_timeoutBox.Text, 3, 300, 15);
-        _sizeBox.Text = mb.ToString();
-        _timeoutBox.Text = timeout.ToString();
-
-        _settings.SpeedTestUrl = url;
-        _settings.SpeedTestMb = mb;
-        _settings.SpeedTestTimeoutSec = timeout;
-        try
-        {
-            _settings.Save();
-        }
-        catch
-        {
-            // 忽略
-        }
-
-        _running = true;
-        _closeAfterTest = false;
-        _closeReady = false;
-        _dotFrame = 0;
-        _results.Clear();
-        _cts = new CancellationTokenSource();
-        UpdateButtons();
-        _dotsTimer.Start();
-        SetStatus("正在测速…");
-
-        foreach (var line in proxies) _list.SetDetail(line, "测速中.");
-
-        var tester = new ProxySpeedTest(_settings, url, mb * 1024L * 1024L, timeout);
-        var progress = new Progress<ProxyBench>(bench =>
-        {
-            _results.RemoveAll(item => item.Line.Equals(bench.Line, StringComparison.OrdinalIgnoreCase));
-            _results.Add(bench);
-            _list.ShowResult(bench);
-        });
-
-        try
-        {
-            await tester.RunAsync(progress, _cts.Token);
-
-            var ordered = ProxySpeedTest.SortProxies(proxies, _results);
-            UpdateLastBench();
-            _list.SetProxies(ordered);
-            SetStatus("测速完成。");
-        }
-        catch (OperationCanceledException)
-        {
-            SetStatus("测速已取消。");
-        }
-        catch (Exception ex)
-        {
-            SetStatus("测速失败：" + ex.Message);
-        }
-        finally
-        {
-            _dotsTimer.Stop();
-            _running = false;
-            try
-            {
-                _cts?.Dispose();
-            }
-            catch
-            {
-                // 忽略
-            }
-            _cts = null;
-            UpdateButtons();
-
-            if (_closeAfterTest)
-            {
-                _closeReady = true;
-                Close();
-            }
-        }
+        base.OnFormClosing(e);
     }
 
-    private void UpdateLastBench()
+    private async Task CloseWhenIdleAsync()
     {
-        var current = TextLines.Split(_settings.ProxyList);
-        var kept = _settings.LastBench
-            .Where(entry => current.Any(line => line.Equals(entry.Line, StringComparison.OrdinalIgnoreCase)))
-            .ToList();
-
-        foreach (var result in _results)
+        var run = _runTask;
+        if (run != null)
         {
-            if (!current.Any(line => line.Equals(result.Line, StringComparison.OrdinalIgnoreCase))) continue;
-            kept.RemoveAll(entry => entry.Line.Equals(result.Line, StringComparison.OrdinalIgnoreCase));
-            kept.Add(result);
+            try { await run; } catch { }
         }
-
-        _settings.LastBench = kept;
-        try
-        {
-            _settings.Save();
-        }
-        catch
-        {
-            // 忽略
-        }
+        Close();
     }
 
-    private void OnDotsTick(object? sender, EventArgs e)
+    protected override void Dispose(bool disposing)
     {
-        _dotFrame = (_dotFrame + 1) % 3;
-        var dots = new string('.', _dotFrame + 1);
-        var done = new HashSet<string>(_results.Select(item => item.Line), StringComparer.OrdinalIgnoreCase);
-
-        foreach (var line in _list.Proxies)
+        if (disposing)
         {
-            if (!done.Contains(line)) _list.SetDetail(line, "测速中" + dots);
+            _animTimer.Stop();
+            _animTimer.Dispose();
+            _tip.Dispose();
+            try { _cts?.Cancel(); } catch { }
         }
-    }
-
-    private static int ClampInt(string text, int min, int max, int fallback)
-    {
-        if (!int.TryParse(text.Trim(), out var value)) return fallback;
-        return Math.Clamp(value, min, max);
+        base.Dispose(disposing);
     }
 }

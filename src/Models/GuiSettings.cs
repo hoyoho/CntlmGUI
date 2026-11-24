@@ -1,29 +1,40 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Text;
-using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using CntlmGUI.Services;
 
 namespace CntlmGUI.Models;
 
-public sealed class GuiSettings
+/// <summary>
+/// CntlmGUI 自身的配置。由用户通过设置界面维护，
+/// 启动时据此动态构造喂给 cntlm 的配置文件。
+/// </summary>
+public class GuiSettings
 {
-    // 认证
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+
+    // ----- 账号与认证 -----
     public string Username { get; set; } = "";
     public string Domain { get; set; } = "";
     public string Workstation { get; set; } = "";
 
+    /// <summary>明文密码只存在于内存；落盘的是 <see cref="PasswordProtected"/>。</summary>
     [JsonIgnore]
     public string Password { get; set; } = "";
 
+    /// <summary>DPAPI 加密后的密码（Base64）。</summary>
     public string PasswordProtected { get; set; } = "";
+
     public string PassLM { get; set; } = "";
     public string PassNT { get; set; } = "";
     public string PassNTLMv2 { get; set; } = "";
     public string Auth { get; set; } = "";
     public string Flags { get; set; } = "";
 
-    // 代理 / 一级 + 二级
+    // ----- 代理与网络 -----
     public string ProxyList { get; set; } = "";
     public bool UseProxy { get; set; }
     public string NoProxyList { get; set; } = "";
@@ -47,241 +58,141 @@ public sealed class GuiSettings
     public bool UseSspi { get; set; }
     public string SspiType { get; set; } = "NTLM";
 
-    // 运行
+    // ----- 运行设置 -----
     public string CntlmPath { get; set; } = "";
     public string OutputConfigPath { get; set; } = "";
     public bool UseService { get; set; }
     public string ServiceName { get; set; } = "cntlm";
     public bool AutoStart { get; set; } = true;
     public bool CloseToTray { get; set; } = true;
+
+    /// <summary>以 -T 记录 cntlm 详细日志；默认关闭，避免长时间运行时 trace 文件持续增长。</summary>
     public bool EnableTrace { get; set; }
 
-    // 测速
+    // ----- 吞吐测速 -----
+    /// <summary>测试目标地址；整链与吞吐测试共用。</summary>
     public string SpeedTestUrl { get; set; } = "https://www.google.com";
+    /// <summary>每个代理最多下载的兆字节数（Range 限制）。</summary>
     public int SpeedTestMb { get; set; } = 10;
+    /// <summary>单个代理的吞吐测试时限（秒）；到达时限即停止，按已下载字节计算速度。</summary>
     public int SpeedTestTimeoutSec { get; set; } = 15;
+
+    /// <summary>上一次测速结果，用于下次打开代理列表时直接回显。</summary>
     public List<ProxyBench> LastBench { get; set; } = new();
 
+    // ----- 派生路径 -----
     [JsonIgnore]
-    public static string ConfigDir => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "CntlmGUI");
-
-    [JsonIgnore]
-    public static string SettingsPath => Path.Combine(ConfigDir, "settings.json");
-
-    [JsonIgnore]
-    public static string DefaultOutputConfigPath => Path.Combine(ConfigDir, "cntlm.ini");
-
-    [JsonIgnore]
-    public static string TraceLogPath => Path.Combine(ConfigDir, "cntlm-trace.log");
-
-    private static readonly JsonSerializerOptions JsonOptions = new()
+    public static string AppDataDir
     {
-        WriteIndented = true,
-        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-    };
+        get
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "CntlmGUI");
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
+    }
 
+    [JsonIgnore]
+    public static string SettingsFile => Path.Combine(AppDataDir, "settings.json");
+
+    [JsonIgnore]
+    public static string DefaultOutputConfig => Path.Combine(AppDataDir, "cntlm.ini");
+
+    [JsonIgnore]
+    public static string TraceLog => Path.Combine(AppDataDir, "cntlm-trace.log");
+
+    // ----- 序列化 -----
     public static GuiSettings Load()
     {
-        try
+        if (File.Exists(SettingsFile))
         {
-            Directory.CreateDirectory(ConfigDir);
-
-            if (!File.Exists(SettingsPath))
+            try
             {
-                var imported = TryImportInitialConfig();
-                var fresh = imported ?? new GuiSettings();
-                try
-                {
-                    fresh.Save();
-                }
-                catch
-                {
-                    // 首次保存失败不阻塞启动
-                }
-                return fresh;
+                var json = File.ReadAllText(SettingsFile, Encoding.UTF8);
+                var s = JsonSerializer.Deserialize<GuiSettings>(json) ?? new GuiSettings();
+                s.DecryptPassword();
+                return s;
             }
-
-            var json = File.ReadAllText(SettingsPath, Encoding.UTF8);
-            var settings = JsonSerializer.Deserialize<GuiSettings>(json, JsonOptions) ?? new GuiSettings();
-            settings.Normalize();
-
-            if (!string.IsNullOrEmpty(settings.PasswordProtected))
+            catch
             {
-                var plain = SecretProtector.Unprotect(settings.PasswordProtected);
-                if (plain != null) settings.Password = plain;
+                // 配置损坏时保留备份，继续用默认值
+                TryBackupCorrupted();
             }
-
-            return settings;
         }
-        catch
-        {
-            TryBackupBrokenSettings();
-            return new GuiSettings();
-        }
+        return new GuiSettings();
     }
 
     public void Save()
     {
-        Directory.CreateDirectory(ConfigDir);
-
-        if (!string.IsNullOrEmpty(Password))
-        {
-            var encrypted = SecretProtector.Protect(Password);
-            // 加密失败时保留上一次密文，绝不写明文
-            if (encrypted != null) PasswordProtected = encrypted;
-        }
-        else
-        {
-            PasswordProtected = "";
-        }
-
-        var json = JsonSerializer.Serialize(this, JsonOptions);
-        File.WriteAllText(SettingsPath, json, new UTF8Encoding(false));
-    }
-
-    public string EffectiveBaseCntlmPath()
-    {
-        if (!string.IsNullOrWhiteSpace(CntlmPath))
-        {
-            try
-            {
-                if (File.Exists(CntlmPath)) return Path.GetFullPath(CntlmPath);
-            }
-            catch
-            {
-                // 忽略非法路径
-            }
-        }
-
-        foreach (var candidate in Detect.KnownCntlmPaths())
-        {
-            try
-            {
-                if (File.Exists(candidate)) return candidate;
-            }
-            catch
-            {
-                // 忽略非法路径
-            }
-        }
-
-        return Detect.FindCntlm() ?? "";
-    }
-
-    /// <summary>供端口探测使用的 host:port；0.0.0.0 / * 归一化为 127.0.0.1。</summary>
-    public static (string Host, int Port) ParseListen(string? listen)
-    {
-        var host = "127.0.0.1";
-        var port = 8080;
-        if (string.IsNullOrWhiteSpace(listen)) return (host, port);
-
-        var text = listen.Trim();
-        var idx = text.LastIndexOf(':');
-        if (idx < 0)
-        {
-            // cntlm 允许只写端口（官方 cntlm.ini 默认就是 Listen 3128）
-            if (int.TryParse(text, out var onlyPort) && onlyPort is >= 1 and <= 65535) port = onlyPort;
-            return (host, port);
-        }
-
-        var rawHost = text[..idx].Trim().Trim('[', ']');
-        if (rawHost.Length > 0) host = rawHost;
-        if (host is "0.0.0.0" or "*" or "+") host = "127.0.0.1";
-
-        if (int.TryParse(text[(idx + 1)..].Trim(), out var parsed) && parsed is >= 1 and <= 65535)
-        {
-            port = parsed;
-        }
-
-        return (host, port);
-    }
-
-    /// <summary>保留原始 host，用于设置界面回显。</summary>
-    public static (string Host, string Port) SplitListen(string? listen)
-    {
-        if (string.IsNullOrWhiteSpace(listen)) return ("127.0.0.1", "8080");
-
-        var text = listen.Trim();
-        var idx = text.LastIndexOf(':');
-        if (idx < 0)
-        {
-            if (int.TryParse(text, out var onlyPort) && onlyPort is >= 1 and <= 65535)
-            {
-                return ("127.0.0.1", onlyPort.ToString());
-            }
-            return ("127.0.0.1", "8080");
-        }
-
-        var host = text[..idx].Trim();
-        var portText = text[(idx + 1)..].Trim();
-        if (host.Length == 0) host = "127.0.0.1";
-        if (portText.Length == 0) portText = "8080";
-        return (host, portText);
-    }
-
-    private void Normalize()
-    {
-        Username ??= "";
-        Domain ??= "";
-        Workstation ??= "";
-        PasswordProtected ??= "";
-        PassLM ??= "";
-        PassNT ??= "";
-        PassNTLMv2 ??= "";
-        Auth ??= "";
-        Flags ??= "";
-        ProxyList ??= "";
-        NoProxyList ??= "";
-        Listen ??= "127.0.0.1:8080";
-        PacFile ??= "";
-        Socks5Proxy ??= "";
-        Socks5User ??= "";
-        AllowList ??= "";
-        DenyList ??= "";
-        TunnelList ??= "";
-        HeaderList ??= "";
-        IsaScannerAgentList ??= "";
-        SspiType = string.IsNullOrWhiteSpace(SspiType) ? "NTLM" : SspiType;
-        CntlmPath ??= "";
-        OutputConfigPath ??= "";
-        ServiceName = string.IsNullOrWhiteSpace(ServiceName) ? "cntlm" : ServiceName;
-        SpeedTestUrl ??= "https://www.google.com";
-        LastBench ??= new List<ProxyBench>();
-        LastBench.RemoveAll(item => item == null);
-    }
-
-    private static GuiSettings? TryImportInitialConfig()
-    {
-        foreach (var path in Detect.KnownIniPaths())
-        {
-            try
-            {
-                if (!File.Exists(path)) continue;
-                return CntlmConfigGenerator.Import(path);
-            }
-            catch
-            {
-                // 导入失败静默忽略
-            }
-        }
-
-        return null;
-    }
-
-    private static void TryBackupBrokenSettings()
-    {
+        Directory.CreateDirectory(AppDataDir);
         try
         {
-            if (File.Exists(SettingsPath))
-            {
-                var backup = $"{SettingsPath}.bak-{DateTime.Now:yyyyMMddHHmmss}";
-                File.Copy(SettingsPath, backup, true);
-            }
+            PasswordProtected = SecretProtector.Protect(Password);
         }
         catch
         {
-            // 备份失败时忽略
+            // 加密失败时保留上一次的密文，绝不把明文写回文件
+        }
+        File.WriteAllText(SettingsFile, JsonSerializer.Serialize(this, JsonOptions), Encoding.UTF8);
+    }
+
+    private void DecryptPassword()
+    {
+        try
+        {
+            Password = SecretProtector.Unprotect(PasswordProtected);
+        }
+        catch
+        {
+            Password = "";
         }
     }
+
+    private static void TryBackupCorrupted()
+    {
+        try
+        {
+            var backup = SettingsFile + ".bak-" + DateTime.Now.ToString("yyyyMMddHHmmss");
+            File.Copy(SettingsFile, backup, overwrite: true);
+        }
+        catch
+        {
+            // 忽略备份失败
+        }
+    }
+
+    public string? EffectiveBaseCntlmPath()
+    {
+        if (!string.IsNullOrWhiteSpace(CntlmPath))
+        {
+            if (File.Exists(CntlmPath)) return CntlmPath;
+            return Detect.WellKnownPaths.FirstOrDefault(File.Exists) ?? CntlmPath;
+        }
+        return Detect.FindCntlm();
+    }
+
+    /// <summary>解析形如 127.0.0.1:8080 的监听地址；非法值回落到默认。</summary>
+    public static (string host, int port) ParseListen(string listen)
+    {
+        var (host, portText) = SplitListen(listen);
+        if (host == "0.0.0.0" || host == "*") host = "127.0.0.1";
+        return (host, int.TryParse(portText, out var port) && port is > 0 and <= 65535 ? port : 8080);
+    }
+
+    /// <summary>拆分监听地址，保留原始 host（供设置界面回显，不做通配归一化）。</summary>
+    public static (string host, string port) SplitListen(string listen)
+    {
+        var t = listen?.Trim() ?? "";
+        if (t.Length == 0) return ("127.0.0.1", "8080");
+        int idx = t.LastIndexOf(':');
+        if (idx <= 0) return ("127.0.0.1", t);
+        var host = t[..idx].Trim();
+        var port = t[(idx + 1)..].Trim();
+        return (host.Length == 0 ? "127.0.0.1" : host, port.Length == 0 ? "8080" : port);
+    }
+
+    /// <summary>把当前设定渲染成可喂给 cntlm 的完整配置文件文本。</summary>
+    public string RenderConfig() => CntlmConfigGenerator.Generate(this);
 }

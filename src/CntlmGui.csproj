@@ -11,8 +11,6 @@
     <Version>1.2.4</Version>
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
     <ApplicationIcon>App.ico</ApplicationIcon>
-    <EnableWindowsTargeting>true</EnableWindowsTargeting>
-    <SelfContained>false</SelfContained>
   </PropertyGroup>
 
   <ItemGroup>

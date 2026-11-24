@@ -1,104 +1,45 @@
-﻿[CmdletBinding()]
-param(
-    [string]$Configuration = "Release",
-    [string]$Runtime = "win-x64"
-)
-
+﻿# CntlmGui MSI build script
+# Requires: .NET SDK 8 + WiX 3.14 (candle.exe / light.exe)
 $ErrorActionPreference = "Stop"
 
-$installerDir = $PSScriptRoot
-$root = Split-Path -Parent $installerDir
-$sourceProject = Join-Path $root "src\CntlmGui.csproj"
-$sourceDir = Join-Path $root "src"
-$vendorDir = Join-Path $root "vendor"
-$buildDir = Join-Path $root "build"
-$publishDir = Join-Path $buildDir "publish"
-$wxsPath = Join-Path $installerDir "CntlmGui.wxs"
-$localePath = Join-Path $installerDir "en-us.wxl"
-$wixobjPath = Join-Path $buildDir "CntlmGui.wixobj"
-$msiPath = Join-Path $buildDir "CntlmGui.msi"
-
-function Find-WixTools {
-    $candidates = @()
-    if (-not [string]::IsNullOrWhiteSpace($env:WIXTOOLS)) { $candidates += $env:WIXTOOLS }
-    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-        $candidates += (Join-Path $env:LOCALAPPDATA "Tauri\WixTools314")
-    }
-    $candidates += "C:\Program Files (x86)\WiX Toolset v3.14"
-    $candidates += "C:\Program Files\WiX Toolset v3.14"
-
-    foreach ($dir in $candidates) {
-        if ([string]::IsNullOrWhiteSpace($dir)) { continue }
-        if (-not (Test-Path $dir)) { continue }
-        $candle = Join-Path $dir "candle.exe"
-        $light = Join-Path $dir "light.exe"
-        if ((Test-Path $candle) -and (Test-Path $light)) { return $dir }
-    }
-
-    throw "未找到 WiX Toolset 3.14。请安装 WiX 3.14，或设置环境变量 WIXTOOLS 指向包含 candle.exe / light.exe 的目录。"
-}
-
-function Invoke-Tool {
-    param(
-        [Parameter(Mandatory = $true)][string]$FilePath,
-        [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [Parameter(Mandatory = $true)][string]$Description
+function Find-WixDir {
+    if ($env:WIXTOOLS) { return $env:WIXTOOLS }
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA "Tauri\WixTools314"),
+        "C:\Program Files (x86)\WiX Toolset v3.14",
+        "C:\Program Files\WiX Toolset v3.14"
     )
-
-    Write-Host "==> $Description"
-    & $FilePath @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Description 失败（退出码 $LASTEXITCODE）。"
+    foreach ($dir in $candidates) {
+        if (Test-Path (Join-Path $dir "candle.exe")) { return $dir }
     }
+    throw "WiX toolset not found. Set WIXTOOLS to the folder containing candle.exe and light.exe."
 }
 
-$wixDir = Find-WixTools
-$candle = Join-Path $wixDir "candle.exe"
-$light = Join-Path $wixDir "light.exe"
-Write-Host "使用 WiX：$wixDir"
+$WixDir   = Find-WixDir
+$Candle   = Join-Path $WixDir "candle.exe"
+$Light    = Join-Path $WixDir "light.exe"
+$WixExt   = Join-Path $WixDir "WixUIExtension.dll"
+$Root     = Split-Path $PSScriptRoot -Parent
+$Publish  = Join-Path $Root "build\publish"
+$OutDir   = Join-Path $Root "build"
+$Proj     = Join-Path $Root "src\CntlmGui.csproj"
 
-$vendorExe = Join-Path $vendorDir "cntlm-0.94.0-win64.exe"
-if (-not (Test-Path $vendorExe)) {
-    throw "缺少 vendor\cntlm-0.94.0-win64.exe。请把 cntlm 0.94.0 安装包放到 vendor 目录后重试。"
-}
+# WiX resolves relative paths in the .wxs against the current directory.
+Set-Location -LiteralPath $PSScriptRoot
 
-New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
-if (Test-Path $publishDir) {
-    Remove-Item -Path $publishDir -Recurse -Force
-}
+# 1) Publish framework-dependent build
+& dotnet publish $Proj -c Release -r win-x64 --self-contained false -o $Publish
+if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed: $LASTEXITCODE" }
 
-Invoke-Tool -FilePath "dotnet" -Description "发布 CntlmGUI" -Arguments @(
-    "publish", $sourceProject,
-    "-c", $Configuration,
-    "-r", $Runtime,
-    "--self-contained", "false",
-    "-o", $publishDir
-)
+# 2) Compile wxs -> wixobj
+New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+$wixObj = Join-Path $OutDir "CntlmGui.wixobj"
+& $Candle -nologo -arch x64 -ext $WixExt -out $wixObj (Join-Path $PSScriptRoot "CntlmGui.wxs")
+if ($LASTEXITCODE -ne 0) { throw "candle failed: $LASTEXITCODE" }
 
-foreach ($name in @("CntlmGUI.exe", "CntlmGUI.dll", "CntlmGUI.deps.json", "CntlmGUI.runtimeconfig.json")) {
-    $file = Join-Path $publishDir $name
-    if (-not (Test-Path $file)) { throw "发布输出缺少 $name。" }
-}
+# 3) Link -> MSI
+$msi = Join-Path $OutDir "CntlmGui.msi"
+& $Light -nologo -ext $WixExt -cultures:en-US -out $msi $wixObj
+if ($LASTEXITCODE -ne 0) { throw "light failed: $LASTEXITCODE" }
 
-Invoke-Tool -FilePath $candle -Description "编译安装包定义" -Arguments @(
-    "-nologo",
-    "-arch", "x64",
-    "-ext", "WixUIExtension.dll",
-    "-dPublishDir=$publishDir",
-    "-dVendorDir=$vendorDir",
-    "-dSourceDir=$sourceDir",
-    "-dInstallerDir=$installerDir",
-    "-out", $wixobjPath,
-    $wxsPath
-)
-
-Invoke-Tool -FilePath $light -Description "链接 MSI" -Arguments @(
-    "-nologo",
-    "-ext", "WixUIExtension.dll",
-    "-cultures:en-US",
-    "-loc", $localePath,
-    "-out", $msiPath,
-    $wixobjPath
-)
-
-Write-Host "已生成 $msiPath"
+Write-Host "Built: $msi" -ForegroundColor Green

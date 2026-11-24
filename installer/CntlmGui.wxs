@@ -1,142 +1,136 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="UTF-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <Product Id="*"
-           Name="CntlmGui"
-           Language="1033"
-           Version="1.2.4"
-           Manufacturer="CntlmGui"
-           Codepage="936"
-           UpgradeCode="44041D13-476A-4313-B53A-9ED3AFD7C79B">
 
-    <Package InstallerVersion="500"
-             Compressed="yes"
-             InstallScope="perMachine"
-             Platform="x64"
-             Description="CntlmGUI - Cntlm 代理管理前端"
-             Comments="CntlmGUI" />
+  <Product
+      Id="*"
+      Name="CntlmGui"
+      Manufacturer="CntlmGui"
+      Version="1.2.4"
+      Language="1033"
+      Codepage="65001"
+      UpgradeCode="44041D13-476A-4313-B53A-9ED3AFD7C79B">
+
+    <Package
+        Id="*"
+        InstallerVersion="450"
+        Compressed="yes"
+        InstallScope="perMachine"
+        Manufacturer="CntlmGui"
+        Description="CntlmGui - Cntlm Windows GUI (bundles cntlm-0.94.0-win64)"
+        Comments="Install/uninstall bundled cntlm-0.94.0-win64 with the app"
+        Keywords="Installer, Cntlm, Proxy" />
 
     <MajorUpgrade Schedule="afterInstallValidate" AllowDowngrades="yes" />
-    <MediaTemplate EmbedCab="yes" />
 
-    <!-- 安装/升级/卸载时通过 Restart Manager 关闭占用本包文件的进程 -->
-    <Property Id="MSIRMSHUTDOWN" Value="1" />
-    <Property Id="ARPNOREPAIR" Value="yes" />
-    <Property Id="ARPINSTALLLOCATION" Secure="yes" />
-    <Property Id="REMOVECNTLM" Secure="yes" />
+    <!-- 安装/升级/卸载时用 Restart Manager 关闭占用本包文件的进程：
+         MSIRMSHUTDOWN=1 = 先优雅关闭，不响应的进程强制结束；
+         按路径精确作用域（只碰持有本包文件的进程，不误杀绿色版）、
+         进程级处理（GUI 藏在托盘也有效）、静默/交互模式均生效。
+         GUI 收到 RM 的 WM_QUERYENDSESSION 后会真正退出（见 MainForm.WndProc）；
+         cntlm.exe 不由本包安装，其文件锁在卸载时由 uninstall-cntlm.ps1 按路径清理。
+         注意：exe 的 FileVersion 必须随构建增长（csproj Version），否则 MSI
+         默认只覆盖更旧文件，同版本"升级"不会替换 exe，修复也不会生效。 -->
+    <Property Id="MSIRMSHUTDOWN" Value="1" Secure="yes" />
+
+    <Media Id="1" Cabinet="cntlmguiapp.cab" EmbedCab="yes" />
+
+    <Icon Id="ProductIcon" SourceFile="..\src\App.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
+    <Property Id="ARPNOREPAIR" Value="yes" Secure="yes" />
+    <SetProperty Id="ARPNOMODIFY" Value="1" After="InstallValidate" Sequence="execute" />
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLDIR]" After="CostFinalize" />
+
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLDIR" />
 
-    <Icon Id="AppIcon.ico" SourceFile="$(var.SourceDir)\App.ico" />
-    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <!-- Checkbox on install-complete dialog: run bundled cntlm installer (checked by default) -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Run cntlm-0.94.0-win64 installer" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" Secure="yes" />
 
-    <!-- 完成页可选：运行 cntlm 安装程序 -->
-    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="运行 cntlm-0.94.0-win64 安装程序" />
-    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <UI>
+      <UIRef Id="WixUI_InstallDir" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2">1</Publish>
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2">1</Publish>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="RunCntlmInstaller">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed</Publish>
+    </UI>
 
-    <CustomAction Id="LaunchCntlmInstaller"
-                  FileKey="CntlmInstallerFile"
-                  ExeCommand=""
+    <!-- Run the bundled cntlm installer (installed file) at end of install -->
+    <CustomAction Id="RunCntlmInstaller" Impersonate="yes" FileKey="CntlmPkg" ExeCommand="" Return="asyncNoWait" />
+
+    <!-- On uninstall, ask whether to also uninstall cntlm (default: keep).
+         Upgrade skips this action (NOT UPGRADINGPRODUCTCODE), so cntlm survives upgrades.
+         Silent uninstall keeps cntlm unless REMOVECNTLM=1 is passed. -->
+    <CustomAction Id="UninstallCntlmCompanion"
                   Execute="immediate"
-                  Return="asyncNoWait" />
-
-    <CustomAction Id="UninstallCntlm"
-                  Directory="INSTALLDIR"
-                  ExeCommand="&quot;[SystemFolder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[INSTALLDIR]uninstall-cntlm.ps1&quot; -Ask -UILevel [UILevel] -RemoveCntlm &quot;[REMOVECNTLM]&quot;"
-                  Execute="deferred"
                   Impersonate="yes"
-                  Return="ignore" />
-
-    <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="ProgramFiles64Folder">
-        <Directory Id="INSTALLDIR" Name="CntlmGui">
-          <Component Id="MainComponent" Guid="0E0A5D8E-5F1A-4C1E-9A4A-1D3F6C0B9A11">
-            <File Id="CntlmGuiExe"
-                  Source="$(var.PublishDir)\CntlmGUI.exe"
-                  KeyPath="yes">
-              <Shortcut Id="DesktopShortcut"
-                        Directory="DesktopFolder"
-                        Name="CntlmGUI"
-                        Description="CntlmGUI - Cntlm 代理管理前端"
-                        WorkingDirectory="INSTALLDIR"
-                        Icon="AppIcon.ico"
-                        Advertise="yes" />
-              <Shortcut Id="StartMenuShortcut"
-                        Directory="ProgramMenuDir"
-                        Name="CntlmGUI"
-                        Description="CntlmGUI - Cntlm 代理管理前端"
-                        WorkingDirectory="INSTALLDIR"
-                        Icon="AppIcon.ico"
-                        Advertise="yes" />
-            </File>
-            <File Id="CntlmGuiDll" Source="$(var.PublishDir)\CntlmGUI.dll" />
-            <File Id="CntlmGuiDepsJson" Source="$(var.PublishDir)\CntlmGUI.deps.json" />
-            <File Id="CntlmGuiRuntimeConfig" Source="$(var.PublishDir)\CntlmGUI.runtimeconfig.json" />
-          </Component>
-
-          <Component Id="CntlmInstallerComponent" Guid="6C5F2B7D-2B0C-4F8C-8C86-2A7E5B4D3C22">
-            <File Id="CntlmInstallerFile"
-                  Source="$(var.VendorDir)\cntlm-0.94.0-win64.exe"
-                  KeyPath="yes" />
-          </Component>
-
-          <Component Id="UninstallScriptComponent" Guid="A1B2C3D4-1111-4E2F-9B8A-0C1D2E3F4A33">
-            <File Id="UninstallScriptFile"
-                  Source="$(var.InstallerDir)\uninstall-cntlm.ps1"
-                  KeyPath="yes" />
-          </Component>
-
-          <Component Id="RegistryComponent" Guid="D4E5F6A7-2222-4B3C-8D9E-1F2A3B4C5D44">
-            <RegistryKey Root="HKLM" Key="Software\CntlmGui">
-              <RegistryValue Type="string" Name="InstallDir" Value="[INSTALLDIR]" KeyPath="yes" />
-              <RegistryValue Type="string" Name="Version" Value="1.2.4" />
-            </RegistryKey>
-          </Component>
-        </Directory>
-      </Directory>
-
-      <Directory Id="ProgramMenuFolder">
-        <Directory Id="ProgramMenuDir" Name="CntlmGui">
-          <Component Id="ProgramMenuComponent" Guid="F7A8B9C0-3333-4D4E-9F5A-2B3C4D5E6F55">
-            <RemoveFolder Id="RemoveProgramMenuDir" On="uninstall" />
-            <Shortcut Id="UninstallShortcut"
-                      Name="卸载 CntlmGUI"
-                      Description="卸载 CntlmGUI"
-                      Target="[SystemFolder]msiexec.exe"
-                      Arguments="/x [ProductCode]" />
-            <RegistryValue Root="HKCU"
-                           Key="Software\CntlmGui"
-                           Name="ProgramMenuShortcut"
-                           Type="integer"
-                           Value="1"
-                           KeyPath="yes" />
-          </Component>
-        </Directory>
-      </Directory>
-
-      <Directory Id="DesktopFolder" />
-    </Directory>
-
-    <Feature Id="MainFeature" Title="CntlmGUI" Level="1" Display="expand">
-      <ComponentRef Id="MainComponent" />
-      <ComponentRef Id="CntlmInstallerComponent" />
-      <ComponentRef Id="UninstallScriptComponent" />
-      <ComponentRef Id="RegistryComponent" />
-      <ComponentRef Id="ProgramMenuComponent" />
-    </Feature>
+                  Return="ignore"
+                  Directory="INSTALLDIR"
+                  ExeCommand="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File uninstall-cntlm.ps1 -Ask -UILevel [UILevel] -RemoveCntlm &quot;[REMOVECNTLM]&quot;" />
 
     <InstallExecuteSequence>
-      <Custom Action="UninstallCntlm" Before="InstallFinalize">
+      <Custom Action="UninstallCntlmCompanion" Before="RemoveFiles">
         <![CDATA[REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE]]>
       </Custom>
     </InstallExecuteSequence>
 
-    <UI>
-      <UIRef Id="WixUI_InstallDir" />
-      <Publish Dialog="ExitDialog"
-               Control="Finish"
-               Event="DoAction"
-               Value="LaunchCntlmInstaller">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed</Publish>
-    </UI>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="DesktopFolder" />
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="CntlmGui" />
+      </Directory>
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="CntlmGui" />
+      </Directory>
+    </Directory>
 
-    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLDIR]" After="CostFinalize" Sequence="execute" />
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="MainApp" Guid="1F2F5A5B-9C54-4B81-8D54-6B09E9A3C8C1" Win64="yes">
+        <File Id="Exe" Name="CntlmGUI.exe" Source="..\build\publish\CntlmGUI.exe" KeyPath="yes" Checksum="yes" />
+        <File Id="Dll" Name="CntlmGUI.dll" Source="..\build\publish\CntlmGUI.dll" />
+        <File Id="Deps" Name="CntlmGUI.deps.json" Source="..\build\publish\CntlmGUI.deps.json" />
+        <File Id="Runtime" Name="CntlmGUI.runtimeconfig.json" Source="..\build\publish\CntlmGUI.runtimeconfig.json" />
+      </Component>
+
+      <Component Id="Cntistone" Guid="0F4C6E1A-7B52-4A9E-BD81-C2D3E4F5A6B7" Win64="yes">
+        <File Id="CntlmPkg" Name="cntlm-0.94.0-win64.exe" Source="..\vendor\cntlm-0.94.0-win64.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="UninstallScript" Guid="05A974BF-3E8A-4F2D-9C6B-8A7B6C5D4E3F" Win64="yes">
+        <File Id="UninstallPs" Name="uninstall-cntlm.ps1" Source="uninstall-cntlm.ps1" KeyPath="yes" />
+      </Component>
+
+      <Component Id="AppReg" Guid="5B2C8D1E-7A43-46F0-9C54-B1D2E3F4A5B6" Win64="yes">
+        <RegistryKey Root="HKLM" Key="Software\CntlmGui">
+          <RegistryValue Name="InstallDir" Type="string" Value="[INSTALLDIR]" KeyPath="yes" />
+          <RegistryValue Name="Version" Type="string" Value="1.2.4" />
+        </RegistryKey>
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="D3A6B2C4-5E7F-4A18-8B9C-0D1E2F3A4B5C" Win64="yes">
+        <Shortcut Id="DesktopLnk" Name="CntlmGui" Target="[#Exe]" WorkingDirectory="INSTALLDIR" />
+        <RegistryValue Root="HKCU" Key="Software\Cntlm\Shortcuts" Name="Desktop" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveFolder Id="DesktopRemove" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="ProgramMenuDir">
+      <Component Id="StartMenuShortcut" Guid="C7F5E3D1-2A4B-4C6D-8E9F-1A2B3C4D5E6F" Win64="yes">
+        <Shortcut Id="StartMenuLnk" Name="CntlmGui" Target="[#Exe]" WorkingDirectory="INSTALLDIR" />
+        <Shortcut Id="UninstallLnk" Name="Uninstall CntlmGui" Target="[System64Folder]msiexec.exe" Arguments="/x [ProductCode]" />
+        <RegistryValue Root="HKCU" Key="Software\Cntlm\Shortcuts" Name="StartMenu" Type="integer" Value="1" KeyPath="yes" />
+        <RemoveFolder Id="RemoveProgramMenuDir" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Complete" Title="CntlmGui" Level="1">
+      <ComponentRef Id="MainApp" />
+      <ComponentRef Id="Cntistone" />
+      <ComponentRef Id="UninstallScript" />
+      <ComponentRef Id="AppReg" />
+      <ComponentRef Id="DesktopShortcut" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+
   </Product>
 </Wix>

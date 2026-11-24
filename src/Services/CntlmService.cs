@@ -1,141 +1,81 @@
-using System.Diagnostics;
+using System;
+using System.IO;
 using System.Text.RegularExpressions;
 using Microsoft.Win32;
 
 namespace CntlmGUI.Services;
 
-internal static class CntlmService
+/// <summary>
+/// 读取 Windows 服务实际使用的 cntlm 配置路径。
+/// 支持 cygrunsrv（Parameters\AppPath/AppArgs）和普通 ImagePath 两种注册方式。
+/// </summary>
+public static class CntlmService
 {
-    private const string ServicesKey = @"SYSTEM\CurrentControlSet\Services";
+    public static bool Exists(string serviceName)
+    {
+        if (string.IsNullOrWhiteSpace(serviceName)) return false;
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(ServiceKey(serviceName));
+            return key != null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
-    /// <summary>解析服务实际使用的 cntlm.ini，解析失败返回 null。</summary>
+    /// <summary>解析服务实际读取的 ini 路径；找不到服务或解析失败返回 null。</summary>
     public static string? ConfigPath(string serviceName)
     {
         if (string.IsNullOrWhiteSpace(serviceName)) return null;
-
         try
         {
-            using var key = Registry.LocalMachine.OpenSubKey($"{ServicesKey}\\{serviceName.Trim()}");
+            var root = ServiceKey(serviceName);
+            using var key = Registry.LocalMachine.OpenSubKey(root);
             if (key == null) return null;
 
-            string? imagePath = key.GetValue("ImagePath") as string;
-            string? appPath = null;
-            string? appArgs = null;
-            using (var parameters = key.OpenSubKey("Parameters"))
-            {
-                appPath = parameters?.GetValue("AppPath") as string;
-                appArgs = parameters?.GetValue("AppArgs") as string;
-            }
+            using var argsKey = Registry.LocalMachine.OpenSubKey(root + @"\Parameters");
+            var appPath = argsKey?.GetValue("AppPath") as string;
+            var appArgs = argsKey?.GetValue("AppArgs") as string ?? "";
+            var imagePath = key.GetValue("ImagePath") as string ?? "";
 
-            foreach (var command in new[] { appArgs, imagePath, appPath })
-            {
-                var path = ExtractConfigPath(command);
-                if (path != null) return path;
-            }
+            var fromArgs = FindConfigArg(appArgs) ?? FindConfigArg(imagePath);
+            if (!string.IsNullOrWhiteSpace(fromArgs))
+                return Environment.ExpandEnvironmentVariables(fromArgs.Trim('"'));
 
-            var executable = FirstExecutable(appPath) ?? FirstExecutable(imagePath);
-            if (executable != null)
-            {
-                var dir = Path.GetDirectoryName(executable);
-                if (!string.IsNullOrEmpty(dir)) return Path.Combine(dir, "cntlm.ini");
-            }
+            // 没有 -c：cntlm 使用可执行文件同目录下的 cntlm.ini
+            var exe = !string.IsNullOrWhiteSpace(appPath) ? appPath : FirstExecutable(imagePath);
+            if (!string.IsNullOrWhiteSpace(exe))
+                return Path.Combine(Path.GetDirectoryName(exe)!, "cntlm.ini");
         }
         catch
         {
-            // 服务不存在或读取失败
+            // 读注册表失败按“未知”处理
         }
-
         return null;
     }
 
-    public static bool IsRunning(string serviceName)
+    private static string ServiceKey(string name) =>
+        $@"SYSTEM\CurrentControlSet\Services\{name}";
+
+    private static string? FindConfigArg(string commandLine)
     {
-        var result = RunSc($"query \"{serviceName?.Trim()}\"");
-        return result.Output.Contains("RUNNING", StringComparison.OrdinalIgnoreCase);
+        var m = Regex.Match(commandLine ?? "", @"(?:^|\s)-c\s+(?:""([^""]+)""|(\S+))");
+        if (!m.Success) return null;
+        return m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value;
     }
 
-    public static (int ExitCode, string Output) RunSc(string arguments)
+    private static string? FirstExecutable(string imagePath)
     {
-        try
+        if (string.IsNullOrWhiteSpace(imagePath)) return null;
+        var t = imagePath.Trim();
+        if (t.StartsWith("\"", StringComparison.Ordinal))
         {
-            var psi = new ProcessStartInfo("sc", arguments)
-            {
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-            };
-
-            using var process = Process.Start(psi);
-            if (process == null) return (-1, "");
-
-            var output = process.StandardOutput.ReadToEnd();
-            var error = process.StandardError.ReadToEnd();
-            if (!process.WaitForExit(15000))
-            {
-                try
-                {
-                    if (!process.HasExited) process.Kill(true);
-                }
-                catch
-                {
-                    // 忽略
-                }
-                return (-1, output + error);
-            }
-
-            return (process.ExitCode, output + error);
+            int end = t.IndexOf('"', 1);
+            return end > 0 ? t[1..end] : t.Trim('"');
         }
-        catch (Exception ex)
-        {
-            return (-1, ex.Message);
-        }
-    }
-
-    private static string? ExtractConfigPath(string? command)
-    {
-        if (string.IsNullOrWhiteSpace(command)) return null;
-
-        try
-        {
-            var match = Regex.Match(command, "(?:^|\\s)-c\\s+(?:\"([^\"]+)\"|(\\S+))");
-            if (!match.Success) return null;
-
-            var path = match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value;
-            path = Environment.ExpandEnvironmentVariables(path.Trim().Trim('"'));
-            return path.Length == 0 ? null : path;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private static string? FirstExecutable(string? command)
-    {
-        if (string.IsNullOrWhiteSpace(command)) return null;
-
-        try
-        {
-            var text = Environment.ExpandEnvironmentVariables(command.Trim());
-            string token;
-            if (text.StartsWith('"'))
-            {
-                var end = text.IndexOf('"', 1);
-                token = end > 1 ? text[1..end] : text.Trim('"');
-            }
-            else
-            {
-                var space = text.IndexOf(' ');
-                token = space > 0 ? text[..space] : text;
-            }
-
-            token = token.Trim().Trim('"');
-            return token.Length == 0 ? null : token;
-        }
-        catch
-        {
-            return null;
-        }
+        int space = t.IndexOf(' ');
+        return space > 0 ? t[..space] : t;
     }
 }

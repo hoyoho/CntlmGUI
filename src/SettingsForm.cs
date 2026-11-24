@@ -1,932 +1,737 @@
+using System;
 using System.Diagnostics;
 using System.Drawing;
-using System.Text;
-using System.Text.RegularExpressions;
+using System.IO;
+using System.Windows.Forms;
 using CntlmGUI.Models;
 using CntlmGUI.Services;
 
 namespace CntlmGUI;
 
-public sealed class SettingsForm : Form
+/// <summary>
+/// 设置对话框，按“一级代理（本地互联）/ 二级代理（对外互联）/ 运行”三页组织：
+/// 一级页只放监听、访问控制、本地路由与本地服务；
+/// 二级页放上游选择与上游认证；
+/// 运行页放 cntlm.exe、配置输出、进程/服务模式与界面行为。
+/// </summary>
+public class SettingsForm : Form
 {
-    private const int FieldWidth = 380;
+    private const int LblW = AppTheme.LabelCol;
 
-    private readonly GuiSettings _settings;
-    private readonly TabControl _tabs;
-    private readonly Panel _bottomPanel;
+    private readonly GuiSettings _s;
 
-    // 一级代理
-    private readonly ComboBox _listenHost = new();
-    private readonly TextBox _listenPort = NewText();
-    private readonly ToggleSwitch _gatewayToggle = NewToggle("允许局域网访问（Gateway）");
-    private readonly TextBox _allowBox = NewText(multiline: true, height: 70);
-    private readonly TextBox _denyBox = NewText(multiline: true, height: 70);
-    private readonly TextBox _noProxyBox = NewText(multiline: true, height: 70);
-    private readonly TextBox _socks5Box = NewText();
-    private readonly TextBox _socks5UserBox = NewText();
-    private readonly TextBox _tunnelBox = NewText(multiline: true, height: 70);
+    // ---- 一级代理（本地互联）----
+    private ComboBox _listenPreset = null!;
+    private TextBox _listen = null!, _noProxy = null!;
+    private TextBox _allow = null!, _deny = null!;
+    private TextBox _socks5 = null!, _socks5User = null!, _tunnel = null!;
+    private ToggleSwitch _gateway = null!;
 
-    // 二级代理
-    private readonly ToggleSwitch _useProxyToggle = NewToggle("启用对外互联（使用上游代理）");
-    private readonly TextBox _pacBox = NewText();
-    private readonly TextBox _headerBox = NewText(multiline: true, height: 60);
-    private readonly ToggleSwitch _isaToggle = NewToggle("启用 ISA 扫描");
-    private readonly TextBox _isaSizeBox = NewText();
-    private readonly TextBox _isaAgentBox = NewText(multiline: true, height: 60);
-    private readonly TextBox _usernameBox = NewText();
-    private readonly TextBox _domainBox = NewText();
-    private readonly TextBox _workstationBox = NewText();
-    private readonly ComboBox _authCombo = NewCombo("默认(自动)", "NTLM", "NTLMv2", "LM", "NT");
-    private readonly ComboBox _flagsCombo = new();
-    private readonly ToggleSwitch _sspiToggle = NewToggle("启用 SSPI");
-    private readonly ComboBox _sspiTypeCombo = NewCombo("NTLM", "negotiate");
-    private readonly TextBox _passwordBox = NewText();
-    private readonly TextBox _passLMBox = NewMonoText();
-    private readonly TextBox _passNTBox = NewMonoText();
-    private readonly TextBox _passNTLMv2Box = NewMonoText();
-    private readonly Label _hashStatus = new();
+    // ---- 二级代理（对外互联）----
+    private ToggleSwitch _useProxy = null!;
+    private Label _proxyWarn = null!;
+    private TableLayoutPanel _upstreamBody = null!;
+    private TextBox _pac = null!, _headers = null!, _isaSize = null!, _isaAgents = null!;
+    private ToggleSwitch _isaEnabled = null!;
+    private TextBox _username = null!, _domain = null!, _workstation = null!, _password = null!;
+    private TextBox _passLm = null!, _passNt = null!, _passV2 = null!;
+    private ComboBox _authCombo = null!, _flagsCombo = null!, _sspiCombo = null!;
+    private ToggleSwitch _sspiEnabled = null!;
+    private Label _authStatus = null!;
 
-    // 运行
-    private readonly TextBox _cntlmPathBox = NewText();
-    private readonly TextBox _outputPathBox = NewText();
-    private readonly ComboBox _modeCombo = NewCombo("子进程", "Windows 服务");
-    private readonly TextBox _serviceNameBox = NewText();
-    private readonly Label _servicePathLabel = new();
-    private readonly ToggleSwitch _autoStartToggle = NewToggle("开机自动启动");
-    private readonly ToggleSwitch _closeToTrayToggle = NewToggle("关闭窗口时最小化到托盘");
-    private readonly ToggleSwitch _traceToggle = NewToggle("记录详细日志（-T）");
-    private readonly Label _importStatus = new();
+    // ---- 运行 ----
+    private TextBox _cntlmPath = null!, _outCfg = null!, _serviceName = null!;
+    private ComboBox _modeCombo = null!;
+    private Label _serviceCfgLbl = null!, _runStatus = null!;
+    private ToggleSwitch _autoStart = null!, _closeToTray = null!, _traceEnabled = null!;
 
-    private Panel? _tier2Body;
-    private Label? _tier2OffHint;
-
-    public SettingsForm(GuiSettings settings)
+    public SettingsForm(GuiSettings source)
     {
-        _settings = settings;
-
+        _s = source;
         Text = "设置";
-        Font = AppTheme.Ui;
-        BackColor = Color.White;
+        StartPosition = FormStartPosition.CenterScreen;
         ClientSize = new Size(620, 780);
-        MinimumSize = new Size(Width, 720);
-        MaximumSize = new Size(Width, 980);
+        MinimumSize = new Size(620, 720);
+        MaximumSize = new Size(620, 980);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
-        MinimizeBox = false;
-        StartPosition = FormStartPosition.CenterParent;
+        Font = AppTheme.Ui;
+        BackColor = Color.White;
 
-        _tabs = new TabControl { Font = AppTheme.Ui };
-        _tabs.TabPages.Add(BuildTier1Page());
-        _tabs.TabPages.Add(BuildTier2Page());
-        _tabs.TabPages.Add(BuildRunPage());
-        Controls.Add(_tabs);
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1, BackColor = Color.White, Padding = new Padding(18, 14, 18, 12) };
+        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
-        _bottomPanel = new Panel { BackColor = Color.White };
-        _bottomPanel.Paint += (_, e) =>
-        {
-            using var pen = new Pen(AppTheme.Line);
-            e.Graphics.DrawLine(pen, 0, 0, _bottomPanel.Width, 0);
-        };
-        Controls.Add(_bottomPanel);
+        var tabs = new TabControl { Dock = DockStyle.Fill };
+        tabs.TabPages.Add(new TabPage("一级代理") { BackColor = Color.White, Controls = { LocalPage() } });
+        tabs.TabPages.Add(new TabPage("二级代理") { BackColor = Color.White, Controls = { UpstreamPage() } });
+        tabs.TabPages.Add(new TabPage("运行") { BackColor = Color.White, Controls = { RunPage() } });
+        root.Controls.Add(tabs, 0, 0);
 
-        var cancel = AppTheme.CreateButton("取消");
-        cancel.Click += (_, _) =>
-        {
-            DialogResult = DialogResult.Cancel;
-            Close();
-        };
-        _bottomPanel.Controls.Add(cancel);
+        var btns = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, Height = 56, Padding = new Padding(0, 12, 0, 10), BackColor = Color.White };
+        btns.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        btns.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        btns.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        var save = new Button { Text = "保存", Width = 116, Height = 34 };
+        AppTheme.StyleButton(save, primary: true);
+        save.Click += (_, _) => Save();
+        var cancel = new Button { Text = "取消", Width = 116, Height = 34, DialogResult = DialogResult.Cancel };
+        AppTheme.StyleButton(cancel);
+        btns.Controls.Add(cancel, 2, 0);
+        btns.Controls.Add(save, 1, 0);
+        root.Controls.Add(btns, 0, 1);
 
-        var save = AppTheme.CreateButton("保存", true);
-        save.Click += OnSaveClick;
-        _bottomPanel.Controls.Add(save);
-
-        _bottomPanel.Tag = new[] { cancel, save };
+        AcceptButton = save;
+        CancelButton = cancel;
+        Controls.Add(root);
 
         LoadValues();
-        LayoutInternal();
     }
 
-    protected override void OnResize(EventArgs e)
+    // ==================== 布局基元 ====================
+
+    private static Panel NewPage(out TableLayoutPanel grid)
     {
-        base.OnResize(e);
-        LayoutInternal();
+        var sc = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Color.White, Padding = new Padding(14, 6, 14, 24) };
+        grid = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, RowCount = 0, Margin = new Padding(0), BackColor = Color.White };
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, LblW));
+        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        sc.Controls.Add(grid);
+        return sc;
     }
 
-    private void LayoutInternal()
+    private static void Section(TableLayoutPanel g, string text)
     {
-        if (_tabs == null || _bottomPanel == null) return;
+        int r = g.RowCount++;
+        g.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        var l = new Label { Text = text, AutoSize = true, Font = AppTheme.UiBold, ForeColor = AppTheme.Text, Margin = new Padding(0, 18, 0, 6) };
+        g.Controls.Add(l, 0, r);
+        g.SetColumnSpan(l, 2);
+    }
 
-        const int bottomHeight = 56;
-        _tabs.SetBounds(12, 12, ClientSize.Width - 24, Math.Max(200, ClientSize.Height - bottomHeight - 20));
-        _bottomPanel.SetBounds(0, ClientSize.Height - bottomHeight, ClientSize.Width, bottomHeight);
+    private static void Field(TableLayoutPanel g, string label, Control c)
+    {
+        int r = g.RowCount++;
+        g.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        if (!string.IsNullOrEmpty(label))
+            g.Controls.Add(FieldLabel(label), 0, r);
+        c.Margin = new Padding(0, 2, 0, 2);
+        g.Controls.Add(c, 1, r);
+    }
 
-        if (_bottomPanel.Tag is Button[] buttons && buttons.Length == 2)
+    private static Label FieldLabel(string text) => new()
+    {
+        Text = text,
+        AutoSize = false,
+        Width = LblW + 2,
+        Height = 30,
+        TextAlign = ContentAlignment.MiddleLeft,
+        Padding = new Padding(0, 0, 8, 0),
+        Margin = new Padding(0, 2, 0, 2),
+        ForeColor = AppTheme.Text,
+    };
+
+    private static void FullWidth(TableLayoutPanel g, Control c)
+    {
+        int r = g.RowCount++;
+        g.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        c.Margin = new Padding(0, 4, 0, 4);
+        g.Controls.Add(c, 0, r);
+        g.SetColumnSpan(c, 2);
+    }
+
+    private static Label Grey(string text, int maxWidth = 480) => new()
+    {
+        Text = text,
+        AutoSize = true,
+        ForeColor = AppTheme.Muted,
+        MaximumSize = new Size(maxWidth, 0),
+        Margin = new Padding(0, 4, 0, 2),
+    };
+
+    private static void Hint(TableLayoutPanel g, string text)
+    {
+        int r = g.RowCount++;
+        g.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        var l = Grey(text, 360);
+        l.Margin = new Padding(0, 2, 0, 2);
+        g.Controls.Add(l, 1, r);
+    }
+
+    // ==================== 控件工厂 ====================
+
+    private static TextBox NewBox(bool mono = false)
+    {
+        var t = new TextBox { Width = 340, Height = 28 };
+        if (mono) t.Font = AppTheme.Mono;
+        return t;
+    }
+
+    private static TextBox NewMulti(int lines) =>
+        new() { Multiline = true, ScrollBars = ScrollBars.Vertical, Width = 340, Height = Math.Max(24, lines * 22 + 6), Font = AppTheme.Mono };
+
+    private static ComboBox NewCombo(params string[] items)
+    {
+        var c = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 340, Height = 26 };
+        c.Items.AddRange(items);
+        if (items.Length > 0) c.SelectedIndex = 0;
+        return c;
+    }
+
+    private static ComboBox NewComboEditable(params string[] presets)
+    {
+        var c = new ComboBox { DropDownStyle = ComboBoxStyle.DropDown, Width = 340, Height = 26 };
+        c.Items.AddRange(presets);
+        return c;
+    }
+
+    private static Button Btn(string text, EventHandler onClick)
+    {
+        var b = new Button { Text = text, AutoSize = true, Height = 30, Margin = new Padding(2) };
+        AppTheme.StyleButton(b);
+        b.Click += onClick;
+        return b;
+    }
+
+    private static void SetComboText(ComboBox c, string value)
+    {
+        var v = value?.Trim() ?? "";
+        if (c.DropDownStyle == ComboBoxStyle.DropDown)
         {
-            var save = buttons[1];
-            var cancel = buttons[0];
-            save.Location = new Point(_bottomPanel.Width - save.Width - 16, 11);
-            cancel.Location = new Point(Math.Max(16, save.Left - cancel.Width - 10), 11);
+            c.Text = v;
+            return;
         }
+        int i = c.Items.IndexOf(v);
+        c.SelectedIndex = i >= 0 ? i : 0;
     }
 
-    private TabPage BuildTier1Page()
+    private static bool HasText(string? s) => !string.IsNullOrWhiteSpace(s);
+
+    // ==================== 一级代理（本地互联）====================
+
+    private Control LocalPage()
     {
-        var page = new TabPage("一级代理") { BackColor = Color.White, AutoScroll = true };
-        var b = new PageBuilder(page);
+        var page = NewPage(out var g);
 
-        b.Section("监听");
+        Section(g, "监听");
+        _listenPreset = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 340, Height = 26 };
+        _listenPreset.Items.AddRange(Detect.GetLocalIpv4().ToArray());
+        _listenPreset.SelectedIndexChanged += (_, _) => ApplyListenPreset();
+        Field(g, "监听地址", _listenPreset);
+        _listen = NewBox();
+        Field(g, "监听端口", _listen);
+        _gateway = new ToggleSwitch { Text = "允许局域网访问（Gateway）", Width = 340 };
+        Field(g, "局域网访问", _gateway);
+        Hint(g, "默认仅本机（127.0.0.1）。监听 0.0.0.0 或勾选 Gateway 后局域网可访问，请同时配置访问控制。");
 
-        _listenHost.DropDownStyle = ComboBoxStyle.DropDownList;
-        _listenHost.Font = AppTheme.Ui;
-        _listenHost.Width = FieldWidth;
-        b.Row("监听地址", _listenHost);
-        b.Row("监听端口", _listenPort, 100);
-        b.Block(_gatewayToggle);
-        b.Hint("默认仅本机；选择 0.0.0.0 或允许局域网访问后，局域网可访问，请同时配置访问控制。");
+        Section(g, "访问控制");
+        _allow = NewMulti(2);
+        _deny = NewMulti(2);
+        Field(g, "白名单", _allow);
+        Field(g, "黑名单", _deny);
+        Hint(g, "每行一条 IP、网段或主机名；为空表示不限制。开放局域网时务必配置。");
 
-        b.Section("访问控制");
-        b.Row("白名单", _allowBox);
-        b.Row("黑名单", _denyBox);
-        b.Hint("每行一条 IP / 网段 / 主机名；为空表示不限制。");
+        Section(g, "本地路由");
+        _noProxy = NewMulti(4);
+        Field(g, "免代地址", _noProxy);
+        Hint(g, "这些地址由本机直接处理，不经过二级代理；支持通配符与 CIDR，每行一个或逗号分隔。");
 
-        b.Section("本地路由");
-        b.Row("免代地址", _noProxyBox);
-        b.Hint("这些地址由本机直接处理，支持通配符与 CIDR。");
-
-        b.Section("本地服务");
-        b.Row("SOCKS5 监听", _socks5Box);
-        b.Row("SOCKS5 认证", _socks5UserBox);
-        b.Row("隧道", _tunnelBox);
-        b.Hint("隧道格式：[saddr:]lport:rhost:rport，每行一条。");
+        Section(g, "本地服务");
+        _socks5 = NewBox();
+        _socks5User = NewBox();
+        Field(g, "SOCKS5 监听", _socks5);
+        Field(g, "SOCKS5 认证", _socks5User);
+        Hint(g, "在本机再开一个 SOCKS5 监听端口（如 1080 或 127.0.0.1:1080）；认证格式 user:password，可留空。");
+        _tunnel = NewMulti(2);
+        Field(g, "隧道", _tunnel);
+        Hint(g, "本地端口转发，每行 [saddr:]lport:rhost:rport，如 11443:remote.com:443。");
 
         return page;
     }
 
-    private TabPage BuildTier2Page()
+    // ==================== 二级代理（对外互联）====================
+
+    private Control UpstreamPage()
     {
-        var page = new TabPage("二级代理") { BackColor = Color.White, AutoScroll = true };
-        var b = new PageBuilder(page);
+        var page = NewPage(out var g);
 
-        _useProxyToggle.Location = new Point(16, 12);
-        _useProxyToggle.Width = 430;
-        _useProxyToggle.CheckedChanged += (_, _) => UpdateTier2Visibility();
-        page.Controls.Add(_useProxyToggle);
-
-        _tier2OffHint = new Label
+        _useProxy = new ToggleSwitch { Text = "启用对外互联（使用上游代理）", Width = 340 };
+        Field(g, "对外互联", _useProxy);
+        _proxyWarn = new Label
         {
             Text = "未启用对外互联时，只有一级代理生效。",
-            Font = AppTheme.UiSmall,
+            AutoSize = true,
             ForeColor = AppTheme.Muted,
-            Location = new Point(16, 46),
-            Size = new Size(520, 20),
+            MaximumSize = new Size(360, 0),
+            Margin = new Padding(0, 2, 0, 6),
+            Visible = false,
         };
-        page.Controls.Add(_tier2OffHint);
+        FullWidth(g, _proxyWarn);
 
-        var body = new Panel { BackColor = Color.White, Location = new Point(0, 74), Width = 570 };
-        _tier2Body = body;
+        // 关闭“对外互联”时，下面的内容整体隐藏（只保留上面的开关和提示）
+        _upstreamBody = new TableLayoutPanel { AutoSize = true, ColumnCount = 2, Margin = new Padding(0), BackColor = Color.White };
+        _upstreamBody.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, LblW));
+        _upstreamBody.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        FullWidth(g, _upstreamBody);
+        _upstreamBody.Visible = _useProxy.Checked;
 
-        var bb = new PageBuilder(body, 0);
+        var editBox = new TableLayoutPanel { AutoSize = true, ColumnCount = 1, Margin = new Padding(0) };
+        editBox.Controls.Add(Btn("代理列表编辑…", (_, _) => OpenSpeedTest()), 0, 0);
+        var editHint = Grey("管理上游代理，测速与排序");
+        editHint.Margin = new Padding(2, 4, 0, 0);
+        editBox.Controls.Add(editHint, 0, 1);
+        Field(_upstreamBody, "", editBox);
 
-        bb.Section("上游代理");
-        bb.Button("代理列表编辑…", OnEditProxyList);
-        bb.Hint("管理上游代理，测速与排序。", indent: 0);
+        Section(_upstreamBody, "上游选择");
+        _pac = NewBox();
+        Field(_upstreamBody, "PAC 文件", _pac);
+        Field(_upstreamBody, "", Btn("浏览…", (_, _) => PickPac()));
+        Hint(_upstreamBody, "让 cntlm 按 PAC 脚本选择上游代理。");
+        _headers = NewMulti(2);
+        Field(_upstreamBody, "请求头替换", _headers);
+        Hint(_upstreamBody, "发往上游的请求头，每行 <name: value>，如 User-Agent: Mozilla。");
 
-        bb.Section("上游选择");
+        _isaEnabled = new ToggleSwitch { Text = "启用 ISA 扫描器", Width = 340 };
+        Field(_upstreamBody, "ISA 扫描", _isaEnabled);
+        _isaSize = NewBox(mono: true);
+        _isaAgents = NewMulti(2);
+        Field(_upstreamBody, "探测包大小 (KB)", _isaSize);
+        Field(_upstreamBody, "代理标识", _isaAgents);
+        Hint(_upstreamBody, "自动探测内网 Microsoft ISA 服务器；代理标识每行一个（至少一个才会生效）。");
 
-        _pacBox.Width = 280;
-        var pacRow = InlineRow(_pacBox, 280, AppTheme.CreateSmallButton("浏览"));
-        pacRow.Controls[^1].Click += OnBrowsePac;
-        bb.Row("PAC 文件", pacRow);
+        Section(_upstreamBody, "上游认证");
+        _username = NewBox();
+        _domain = NewBox();
+        _workstation = NewBox();
+        Field(_upstreamBody, "用户名", _username);
+        Field(_upstreamBody, "域", _domain);
+        Field(_upstreamBody, "工作站", _workstation);
 
-        bb.Row("请求头替换", _headerBox);
-        bb.Hint("格式：HeaderName: value，每行一条。");
+        _authCombo = NewCombo("默认(自动)", "NTLM", "NTLMv2", "LM", "NT");
+        _flagsCombo = NewComboEditable("默认(自动)", "0x00020000", "0x06820000", "0x06800000", "0x02088207");
+        Field(_upstreamBody, "认证类型", _authCombo);
+        Field(_upstreamBody, "Flags", _flagsCombo);
 
-        bb.Block(_isaToggle);
-        bb.Row("探测包大小(KB)", _isaSizeBox, 100);
-        bb.Row("代理标识", _isaAgentBox);
-        bb.Hint("ISA 扫描至少需要一条代理标识才会生效。");
+        _sspiEnabled = new ToggleSwitch { Text = "使用 Windows 集成认证（SSPI）", Width = 340 };
+        _sspiCombo = NewCombo("NTLM", "negotiate");
+        Field(_upstreamBody, "SSPI", _sspiEnabled);
+        Field(_upstreamBody, "SSPI 类型", _sspiCombo);
+        Hint(_upstreamBody, "启用后由 Windows 当前登录用户完成认证，通常不需要再填密码/哈希。");
 
-        bb.Section("上游认证");
-        bb.Row("用户名", _usernameBox);
-        bb.Row("域", _domainBox);
-        bb.Row("工作站", _workstationBox);
-        bb.Row("认证类型", _authCombo);
+        _password = NewBox();
+        _password.UseSystemPasswordChar = true;
+        Field(_upstreamBody, "密码", _password);
+        Hint(_upstreamBody, "仅用于计算哈希；若已填 PassLM/PassNT/PassNTLMv2，可省略。");
 
-        _flagsCombo.DropDownStyle = ComboBoxStyle.DropDown;
-        _flagsCombo.Font = AppTheme.Ui;
-        _flagsCombo.Width = FieldWidth;
-        _flagsCombo.Items.AddRange(new object[]
+        _passLm = NewBox(mono: true);
+        _passNt = NewBox(mono: true);
+        _passV2 = NewBox(mono: true);
+        Field(_upstreamBody, "PassLM", _passLm);
+        Field(_upstreamBody, "PassNT", _passNt);
+        Field(_upstreamBody, "PassNTLMv2", _passV2);
+
+        var ops = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
+        ops.Controls.Add(Btn("生成哈希", (_, _) => GenerateHash()));
+        Field(_upstreamBody, "", ops);
+        _authStatus = new Label { Text = "", AutoSize = true, ForeColor = AppTheme.Muted, MaximumSize = new Size(360, 0) };
+        FullWidth(_upstreamBody, _authStatus);
+
+        _useProxy.CheckedChanged += (_, _) =>
         {
-            "默认(自动)", "0x00020000", "0x06820000", "0x06800000", "0x02088207",
-        });
-        _flagsCombo.SelectedIndex = 0;
-        bb.Row("Flags", _flagsCombo);
+            bool on = _useProxy.Checked;
+            _proxyWarn.Visible = !on;
+            _upstreamBody.Visible = on;
+        };
+        return page;
+    }
 
-        bb.Block(_sspiToggle);
-        bb.Row("SSPI 类型", _sspiTypeCombo);
+    // ==================== 运行 ====================
 
-        _passwordBox.UseSystemPasswordChar = true;
-        _passwordBox.Width = FieldWidth;
-        bb.Row("密码", _passwordBox);
+    private Control RunPage()
+    {
+        var page = NewPage(out var g);
 
-        _passLMBox.Font = AppTheme.Mono;
-        _passNTBox.Font = AppTheme.Mono;
-        _passNTLMv2Box.Font = AppTheme.Mono;
-        bb.Row("PassLM", _passLMBox);
-        bb.Row("PassNT", _passNTBox);
-        bb.Row("PassNTLMv2", _passNTLMv2Box);
+        Section(g, "程序与配置");
+        _cntlmPath = NewBox();
+        Field(g, "可执行文件", _cntlmPath);
+        var exeOps = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
+        exeOps.Controls.Add(Btn("检测", (_, _) => AutoDetect()));
+        exeOps.Controls.Add(Btn("浏览…", (_, _) => PickFile()));
+        Field(g, "", exeOps);
 
-        var hashButton = AppTheme.CreateButton("生成哈希");
-        hashButton.Location = new Point(16, bb.Y);
-        hashButton.Click += OnGenerateHash;
-        body.Controls.Add(hashButton);
-        bb.Gap(hashButton.Height + 8);
+        _outCfg = NewBox();
+        Field(g, "输出路径", _outCfg);
+        var outOps = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
+        outOps.Controls.Add(Btn("默认", (_, _) => _outCfg.Text = GuiSettings.DefaultOutputConfig));
+        outOps.Controls.Add(Btn("浏览…", (_, _) => PickPath()));
+        outOps.Controls.Add(Btn("预览…", (_, _) => PreviewConfig()));
+        Field(g, "", outOps);
 
-        _hashStatus.Text = "";
-        _hashStatus.Font = AppTheme.UiSmall;
-        _hashStatus.ForeColor = AppTheme.Muted;
-        _hashStatus.AutoSize = false;
-        _hashStatus.Height = 32;
-        bb.Block(_hashStatus, 0, 420);
+        Section(g, "运行方式");
+        _modeCombo = NewCombo("子进程", "Windows 服务");
+        Field(g, "运行模式", _modeCombo);
+        _serviceName = NewBox();
+        Field(g, "服务名", _serviceName);
+        _serviceCfgLbl = new Label { Text = "", AutoSize = true, ForeColor = AppTheme.Muted, MaximumSize = new Size(360, 0) };
+        FullWidth(g, _serviceCfgLbl);
+        Hint(g, "服务模式会写入服务实际读取的 ini（通常需要管理员权限）；未安装服务时请先用 cntlm 安装器创建。");
+        _modeCombo.SelectedIndexChanged += (_, _) =>
+        {
+            bool service = _modeCombo.SelectedIndex == 1;
+            _serviceName.Enabled = service;
+            UpdateServicePath();
+        };
+        _serviceName.TextChanged += (_, _) => UpdateServicePath();
 
-        body.Height = bb.Y + 10;
-        page.Controls.Add(body);
+        Section(g, "界面行为");
+        _autoStart = new ToggleSwitch { Text = "启动程序时自动启动代理", Width = 340 };
+        _closeToTray = new ToggleSwitch { Text = "关闭窗口时最小化到托盘", Width = 340 };
+        _traceEnabled = new ToggleSwitch { Text = "记录详细日志（-T）", Width = 340 };
+        Field(g, "自启动", _autoStart);
+        Field(g, "最小化", _closeToTray);
+        Field(g, "详细日志", _traceEnabled);
+        Hint(g, "详细日志会持续写入文件，适合排查问题时临时开启。");
+
+        Section(g, "配置迁移");
+        Field(g, "", Btn("从 cntlm.ini 导入…", (_, _) => ImportConfig()));
+
+        _runStatus = new Label { Text = "", AutoSize = true, ForeColor = AppTheme.Muted, MaximumSize = new Size(520, 0) };
+        FullWidth(g, _runStatus);
 
         return page;
     }
 
-    private TabPage BuildRunPage()
-    {
-        var page = new TabPage("运行") { BackColor = Color.White, AutoScroll = true };
-        var b = new PageBuilder(page);
-
-        b.Section("程序与配置");
-        _cntlmPathBox.Width = 220;
-        var pathRow = InlineRow(_cntlmPathBox, 220,
-            AppTheme.CreateSmallButton("检测"), AppTheme.CreateSmallButton("浏览"));
-        pathRow.Controls[1].Click += OnDetectCntlm;
-        pathRow.Controls[2].Click += OnBrowseCntlm;
-        b.Row("可执行文件", pathRow);
-
-        _outputPathBox.Width = 140;
-        var outputRow = InlineRow(_outputPathBox, 140,
-            AppTheme.CreateSmallButton("默认"), AppTheme.CreateSmallButton("浏览"), AppTheme.CreateSmallButton("预览…"));
-        outputRow.Controls[1].Click += (_, _) => _outputPathBox.Text = GuiSettings.DefaultOutputConfigPath;
-        outputRow.Controls[2].Click += OnBrowseOutput;
-        outputRow.Controls[3].Click += OnPreviewClick;
-        b.Row("输出路径", outputRow);
-
-        b.Section("运行方式");
-        bbRow(b, "运行方式", _modeCombo);
-        b.Row("服务名", _serviceNameBox);
-        _modeCombo.SelectedIndexChanged += (_, _) => UpdateServicePathLabel();
-        _serviceNameBox.TextChanged += (_, _) => UpdateServicePathLabel();
-
-        _servicePathLabel.Font = AppTheme.UiSmall;
-        _servicePathLabel.ForeColor = AppTheme.Muted;
-        _servicePathLabel.AutoSize = false;
-        _servicePathLabel.Height = 22;
-        _servicePathLabel.AutoEllipsis = true;
-        b.Block(_servicePathLabel, 0, 560);
-        b.Hint("服务模式通常需要管理员权限。", indent: 0);
-
-        b.Section("界面行为");
-        b.Block(_autoStartToggle);
-        b.Block(_closeToTrayToggle);
-        b.Block(_traceToggle);
-        b.Hint("开启详细日志后会持续写入 trace 日志文件。", indent: 0);
-
-        b.Section("配置迁移");
-        b.Button("从 cntlm.ini 导入…", OnImportClick);
-
-        _importStatus.Text = "";
-        _importStatus.Font = AppTheme.UiSmall;
-        _importStatus.ForeColor = AppTheme.Muted;
-        _importStatus.AutoSize = false;
-        _importStatus.Height = 22;
-        b.Block(_importStatus, 0, 480);
-
-        return page;
-    }
-
-    private static void bbRow(PageBuilder builder, string label, Control control) => builder.Row(label, control);
-
-    private void UpdateTier2Visibility()
-    {
-        var enabled = _useProxyToggle.Checked;
-        if (_tier2Body != null) _tier2Body.Visible = enabled;
-        if (_tier2OffHint != null) _tier2OffHint.Visible = !enabled;
-    }
+    // ==================== 装载 / 保存 ====================
 
     private void LoadValues()
     {
-        var hosts = new List<string> { "0.0.0.0", "127.0.0.1" };
-        try
+        ApplyToControls(_s);
+
+        _cntlmPath.Text = _s.CntlmPath;
+        if (string.IsNullOrWhiteSpace(_cntlmPath.Text))
         {
-            foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
-            {
-                if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
-                if (nic.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Tunnel) continue;
-                foreach (var address in nic.GetIPProperties().UnicastAddresses)
-                {
-                    var ip = address.Address;
-                    if (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) continue;
-                    var text = ip.ToString();
-                    if (text.StartsWith("169.254.", StringComparison.Ordinal)) continue;
-                    if (!hosts.Contains(text)) hosts.Add(text);
-                }
-            }
-        }
-        catch
-        {
-            // 忽略网卡枚举失败
+            var found = Detect.FindCntlm();
+            if (!string.IsNullOrWhiteSpace(found)) _cntlmPath.Text = found;
         }
 
-        var (host, portText) = GuiSettings.SplitListen(_settings.Listen);
-        if (!hosts.Contains(host)) hosts.Add(host);
-        _listenHost.Items.Clear();
-        _listenHost.Items.AddRange(hosts.Cast<object>().ToArray());
-        _listenHost.SelectedItem = host;
-
-        _listenPort.Text = portText;
-        _gatewayToggle.Checked = _settings.Gateway;
-        _allowBox.Text = _settings.AllowList;
-        _denyBox.Text = _settings.DenyList;
-        _noProxyBox.Text = _settings.NoProxyList;
-        _socks5Box.Text = _settings.Socks5Proxy;
-        _socks5UserBox.Text = _settings.Socks5User;
-        _tunnelBox.Text = _settings.TunnelList;
-
-        _useProxyToggle.Checked = _settings.UseProxy;
-        _pacBox.Text = _settings.PacFile;
-        _headerBox.Text = _settings.HeaderList;
-        _isaToggle.Checked = _settings.UseIsaScanner;
-        _isaSizeBox.Text = _settings.IsaScannerSize.ToString();
-        _isaAgentBox.Text = _settings.IsaScannerAgentList;
-
-        _usernameBox.Text = _settings.Username;
-        _domainBox.Text = _settings.Domain;
-        _workstationBox.Text = _settings.Workstation;
-
-        if (!string.IsNullOrWhiteSpace(_settings.Auth))
-        {
-            if (!_authCombo.Items.Contains(_settings.Auth)) _authCombo.Items.Add(_settings.Auth);
-            _authCombo.SelectedItem = _settings.Auth;
-        }
-        else
-        {
-            _authCombo.SelectedIndex = 0;
-        }
-
-        if (string.IsNullOrWhiteSpace(_settings.Flags))
-        {
-            _flagsCombo.SelectedIndex = 0;
-        }
-        else
-        {
-            _flagsCombo.Text = _settings.Flags;
-        }
-
-        _sspiToggle.Checked = _settings.UseSspi;
-        if (!_sspiTypeCombo.Items.Contains(_settings.SspiType)) _sspiTypeCombo.Items.Add(_settings.SspiType);
-        _sspiTypeCombo.SelectedItem = string.IsNullOrWhiteSpace(_settings.SspiType) ? "NTLM" : _settings.SspiType;
-
-        _passwordBox.Text = _settings.Password;
-        _passLMBox.Text = _settings.PassLM;
-        _passNTBox.Text = _settings.PassNT;
-        _passNTLMv2Box.Text = _settings.PassNTLMv2;
-
-        _cntlmPathBox.Text = _settings.CntlmPath;
-        _outputPathBox.Text = _settings.OutputConfigPath;
-        _modeCombo.SelectedIndex = _settings.UseService ? 1 : 0;
-        _serviceNameBox.Text = _settings.ServiceName;
-        _autoStartToggle.Checked = _settings.AutoStart;
-        _closeToTrayToggle.Checked = _settings.CloseToTray;
-        _traceToggle.Checked = _settings.EnableTrace;
-
-        UpdateTier2Visibility();
-        UpdateServicePathLabel();
+        _outCfg.Text = string.IsNullOrWhiteSpace(_s.OutputConfigPath) ? GuiSettings.DefaultOutputConfig : _s.OutputConfigPath;
+        _modeCombo.SelectedIndex = _s.UseService ? 1 : 0;
+        _serviceName.Text = _s.ServiceName;
+        _serviceName.Enabled = _s.UseService;
+        _autoStart.Checked = _s.AutoStart;
+        _closeToTray.Checked = _s.CloseToTray;
+        _traceEnabled.Checked = _s.EnableTrace;
+        UpdateServicePath();
     }
 
-    private void ApplyTo(GuiSettings target)
+    /// <summary>把一份配置映射到各输入控件（装载与导入共用）。</summary>
+    private void ApplyToControls(GuiSettings v)
     {
-        var host = _listenHost.Text.Trim();
-        if (host.Length == 0) host = "127.0.0.1";
-        var portText = _listenPort.Text.Trim();
-        var port = int.TryParse(portText, out var parsedPort) && parsedPort is >= 1 and <= 65535 ? parsedPort : 8080;
-        target.Listen = $"{host}:{port}";
-        target.Gateway = _gatewayToggle.Checked;
+        var (ip, port) = GuiSettings.SplitListen(v.Listen);
+        _listen.Text = port;
+        SelectListenIp(ip);
+        _gateway.Checked = v.Gateway;
+        _noProxy.Text = v.NoProxyList;
+        _allow.Text = v.AllowList;
+        _deny.Text = v.DenyList;
+        _socks5.Text = v.Socks5Proxy;
+        _socks5User.Text = v.Socks5User;
+        _tunnel.Text = v.TunnelList;
 
-        target.AllowList = _allowBox.Text.Trim();
-        target.DenyList = _denyBox.Text.Trim();
-        target.UseAllow = TextLines.Split(target.AllowList).Length > 0 || TextLines.Split(target.DenyList).Length > 0;
-        target.NoProxyList = _noProxyBox.Text.Trim();
+        _useProxy.Checked = v.UseProxy;
+        _proxyWarn.Visible = !v.UseProxy;
+        _upstreamBody.Visible = v.UseProxy;
+        _pac.Text = v.PacFile;
+        _headers.Text = v.HeaderList;
+        _isaEnabled.Checked = v.UseIsaScanner;
+        _isaSize.Text = v.IsaScannerSize.ToString();
+        _isaAgents.Text = v.IsaScannerAgentList;
 
-        target.Socks5Proxy = _socks5Box.Text.Trim();
-        target.Socks5User = _socks5UserBox.Text.Trim();
-        target.UseSocks5 = target.Socks5Proxy.Length > 0;
-        target.TunnelList = _tunnelBox.Text.Trim();
-        target.UseTunnel = TextLines.Split(target.TunnelList).Length > 0;
-
-        target.UseProxy = _useProxyToggle.Checked;
-        target.PacFile = _pacBox.Text.Trim();
-        target.UsePac = target.PacFile.Length > 0;
-        target.HeaderList = _headerBox.Text.Trim();
-        target.UseHeader = TextLines.Split(target.HeaderList).Length > 0;
-        target.UseIsaScanner = _isaToggle.Checked;
-        target.IsaScannerSize = int.TryParse(_isaSizeBox.Text.Trim(), out var isaSize) ? Math.Max(0, isaSize) : 1024;
-        target.IsaScannerAgentList = _isaAgentBox.Text.Trim();
-
-        target.Username = _usernameBox.Text.Trim();
-        target.Domain = _domainBox.Text.Trim();
-        target.Workstation = _workstationBox.Text.Trim();
-        target.Auth = _authCombo.SelectedIndex <= 0 ? "" : _authCombo.SelectedItem?.ToString() ?? "";
-        var flagsText = _flagsCombo.Text.Trim();
-        target.Flags = flagsText == "默认(自动)" ? "" : flagsText;
-        target.UseSspi = _sspiToggle.Checked;
-        target.SspiType = string.IsNullOrWhiteSpace(_sspiTypeCombo.Text) ? "NTLM" : _sspiTypeCombo.Text.Trim();
-        target.Password = _passwordBox.Text;
-        target.PassLM = _passLMBox.Text.Trim();
-        target.PassNT = _passNTBox.Text.Trim();
-        target.PassNTLMv2 = _passNTLMv2Box.Text.Trim();
-
-        target.CntlmPath = _cntlmPathBox.Text.Trim();
-        target.OutputConfigPath = _outputPathBox.Text.Trim();
-        target.UseService = _modeCombo.SelectedIndex == 1;
-        target.ServiceName = string.IsNullOrWhiteSpace(_serviceNameBox.Text) ? "cntlm" : _serviceNameBox.Text.Trim();
-        target.AutoStart = _autoStartToggle.Checked;
-        target.CloseToTray = _closeToTrayToggle.Checked;
-        target.EnableTrace = _traceToggle.Checked;
+        _username.Text = v.Username;
+        _domain.Text = v.Domain;
+        _workstation.Text = v.Workstation;
+        SetComboText(_authCombo, v.Auth);
+        SetComboText(_flagsCombo, v.Flags);
+        _sspiEnabled.Checked = v.UseSspi;
+        SetComboText(_sspiCombo, v.SspiType);
+        _password.Text = v.Password;
+        _passLm.Text = v.PassLM;
+        _passNt.Text = v.PassNT;
+        _passV2.Text = v.PassNTLMv2;
     }
 
-    private void OnSaveClick(object? sender, EventArgs e)
+    private void Save()
     {
-        var portText = _listenPort.Text.Trim();
-        if (!int.TryParse(portText, out var port) || port is < 1 or > 65535)
+        if (!int.TryParse(_listen.Text.Trim(), out var port) || port is <= 0 or > 65535)
         {
-            MessageBox.Show(this, "监听端口必须是 1–65535 之间的数字。", "设置",
+            MessageBox.Show(this, "监听端口必须是 1-65535 之间的数字。", "设置",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            _listenPort.Focus();
-            _listenPort.SelectAll();
             return;
         }
 
-        ApplyTo(_settings);
-
-        try
-        {
-            _settings.Save();
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, "保存设置失败：" + ex.Message, "设置",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return;
-        }
-
+        ApplyUiTo(_s);
+        _s.Save();
         DialogResult = DialogResult.OK;
         Close();
     }
 
-    private void UpdateServicePathLabel()
+    /// <summary>把界面上的值写入给定配置对象（保存与预览共用）。</summary>
+    private void ApplyUiTo(GuiSettings s)
     {
+        s.Listen = ListenValue();
+        s.Gateway = _gateway.Checked;
+        s.NoProxyList = _noProxy.Text;
+        s.AllowList = _allow.Text;
+        s.DenyList = _deny.Text;
+        s.UseAllow = HasText(_allow.Text) || HasText(_deny.Text);
+        s.Socks5Proxy = _socks5.Text.Trim();
+        s.Socks5User = _socks5User.Text.Trim();
+        s.UseSocks5 = HasText(s.Socks5Proxy);
+        s.TunnelList = _tunnel.Text;
+        s.UseTunnel = HasText(s.TunnelList);
+
+        s.UseProxy = _useProxy.Checked;
+        s.PacFile = _pac.Text.Trim();
+        s.UsePac = HasText(s.PacFile);
+        s.HeaderList = _headers.Text;
+        s.UseHeader = HasText(s.HeaderList);
+        s.IsaScannerSize = int.TryParse(_isaSize.Text.Trim(), out var size) ? Math.Max(0, size) : 0;
+        s.IsaScannerAgentList = _isaAgents.Text;
+        s.UseIsaScanner = _isaEnabled.Checked;
+
+        s.Username = _username.Text.Trim();
+        s.Domain = _domain.Text.Trim();
+        s.Workstation = _workstation.Text.Trim();
+        s.Auth = DefaultIfAutomatic(_authCombo.Text);
+        s.Flags = DefaultIfAutomatic(_flagsCombo.Text);
+        s.UseSspi = _sspiEnabled.Checked;
+        s.SspiType = _sspiCombo.Text.Trim();
+        s.Password = _password.Text;
+        s.PassLM = _passLm.Text.Trim();
+        s.PassNT = _passNt.Text.Trim();
+        s.PassNTLMv2 = _passV2.Text.Trim();
+
+        s.CntlmPath = _cntlmPath.Text.Trim();
+        s.OutputConfigPath = _outCfg.Text.Trim();
+        s.UseService = _modeCombo.SelectedIndex == 1;
+        s.ServiceName = _serviceName.Text.Trim();
+        s.AutoStart = _autoStart.Checked;
+        s.CloseToTray = _closeToTray.Checked;
+        s.EnableTrace = _traceEnabled.Checked;
+    }
+
+    private string ListenValue()
+    {
+        var portText = _listen.Text.Trim();
+        if (!int.TryParse(portText, out var port) || port is <= 0 or > 65535)
+            port = GuiSettings.ParseListen(_s.Listen).port;
+        return $"{ListenIp()}:{port}";
+    }
+
+    private static string DefaultIfAutomatic(string text) =>
+        text.Trim() == "默认(自动)" ? "" : text.Trim();
+
+    // ==================== 动作 ====================
+
+    private void ApplyListenPreset()
+    {
+        if (string.IsNullOrWhiteSpace(_listen.Text)) _listen.Text = "8080";
+    }
+
+    private string ListenIp() => _listenPreset.SelectedItem?.ToString() ?? "127.0.0.1";
+
+    private void SelectListenIp(string ip)
+    {
+        int idx = _listenPreset.Items.IndexOf(ip);
+        if (idx < 0) idx = _listenPreset.Items.IndexOf("127.0.0.1"); // 默认仅本机
+        _listenPreset.SelectedIndex = idx >= 0 ? idx : 0;
+    }
+
+    private void UpdateServicePath()
+    {
+        if (_serviceCfgLbl == null) return;
         if (_modeCombo.SelectedIndex != 1)
         {
-            _servicePathLabel.Text = "服务实际配置：仅服务模式使用";
-            _servicePathLabel.ForeColor = AppTheme.Muted;
+            _serviceCfgLbl.Text = "服务实际配置：仅服务模式使用";
             return;
         }
-
-        var name = string.IsNullOrWhiteSpace(_serviceNameBox.Text) ? "cntlm" : _serviceNameBox.Text.Trim();
-        var path = CntlmService.ConfigPath(name);
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            _servicePathLabel.Text = "服务实际配置：未找到该服务（请先用 cntlm 安装器创建）";
-            _servicePathLabel.ForeColor = AppTheme.Muted;
-        }
-        else
-        {
-            _servicePathLabel.Text = "服务实际配置：" + path;
-            _servicePathLabel.ForeColor = AppTheme.Text;
-        }
+        var path = CntlmService.ConfigPath(_serviceName.Text.Trim());
+        _serviceCfgLbl.Text = path == null
+            ? "服务实际配置：未找到该服务（请先用 cntlm 安装器创建）"
+            : "服务实际配置：" + path;
     }
 
-    private void OnDetectCntlm(object? sender, EventArgs e)
+    private void PickPac()
+    {
+        using var d = new OpenFileDialog { Filter = "PAC|*.pac;*.txt|所有|*.*" };
+        if (d.ShowDialog() == DialogResult.OK) _pac.Text = d.FileName;
+    }
+
+    private void PickFile()
+    {
+        using var d = new OpenFileDialog { Filter = "cntlm.exe|cntlm.exe" };
+        if (d.ShowDialog() == DialogResult.OK) _cntlmPath.Text = d.FileName;
+    }
+
+    private void PickPath()
+    {
+        using var d = new SaveFileDialog { Filter = "ini|*.ini", FileName = "cntlm.ini" };
+        if (d.ShowDialog() == DialogResult.OK) _outCfg.Text = d.FileName;
+    }
+
+    private void AutoDetect()
     {
         var found = Detect.FindCntlm();
-        if (string.IsNullOrWhiteSpace(found))
-        {
-            MessageBox.Show(this, "未找到 cntlm.exe，请手动浏览指定。", "检测",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
-
-        _cntlmPathBox.Text = found;
+        _cntlmPath.Text = found ?? "";
+        _runStatus.Text = found is null ? "未自动找到 cntlm，请手动指定路径。" : "已找到: " + found;
     }
 
-    private void OnBrowseCntlm(object? sender, EventArgs e)
+    private void PreviewConfig()
     {
-        using var dialog = new OpenFileDialog
-        {
-            Title = "选择 cntlm.exe",
-            Filter = "cntlm (cntlm.exe)|cntlm.exe|可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*",
-        };
-        if (dialog.ShowDialog(this) == DialogResult.OK) _cntlmPathBox.Text = dialog.FileName;
-    }
+        var preview = new GuiSettings();
+        ApplyUiTo(preview);
+        preview.ProxyList = _s.ProxyList; // 代理列表在单独窗口维护
+        preview.Password = _password.Text;
 
-    private void OnBrowseOutput(object? sender, EventArgs e)
-    {
-        using var dialog = new SaveFileDialog
+        using var dlg = new Form
         {
-            Title = "选择输出配置文件",
-            Filter = "cntlm 配置 (*.ini)|*.ini|所有文件 (*.*)|*.*",
-            FileName = "cntlm.ini",
-        };
-        if (dialog.ShowDialog(this) == DialogResult.OK) _outputPathBox.Text = dialog.FileName;
-    }
-
-    private void OnBrowsePac(object? sender, EventArgs e)
-    {
-        using var dialog = new OpenFileDialog
-        {
-            Title = "选择 PAC 文件",
-            Filter = "PAC 文件 (*.pac)|*.pac|所有文件 (*.*)|*.*",
-        };
-        if (dialog.ShowDialog(this) == DialogResult.OK) _pacBox.Text = dialog.FileName;
-    }
-
-    private void OnEditProxyList(object? sender, EventArgs e)
-    {
-        using var form = new ProxySpeedForm(_settings);
-        form.ShowDialog(this);
-    }
-
-    private void OnPreviewClick(object? sender, EventArgs e)
-    {
-        var temp = new GuiSettings();
-        ApplyTo(temp);
-        temp.ProxyList = _settings.ProxyList;
-        temp.LastBench = _settings.LastBench;
-
-        string text;
-        try
-        {
-            text = CntlmConfigGenerator.Generate(temp);
-        }
-        catch (Exception ex)
-        {
-            text = "生成配置失败：" + ex.Message;
-        }
-
-        var preview = new Form
-        {
-            Text = "配置预览",
-            ClientSize = new Size(760, 560),
-            FormBorderStyle = FormBorderStyle.FixedSingle,
-            MaximizeBox = false,
-            MinimizeBox = false,
+            Text = "生成的 cntlm 配置",
             StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(760, 560),
             Font = AppTheme.Ui,
             BackColor = Color.White,
+            MinimizeBox = false,
+            MaximizeBox = false,
+            FormBorderStyle = FormBorderStyle.SizableToolWindow,
         };
         var box = new TextBox
         {
+            Dock = DockStyle.Fill,
             Multiline = true,
             ReadOnly = true,
             ScrollBars = ScrollBars.Both,
             WordWrap = false,
             Font = AppTheme.Mono,
-            BorderStyle = BorderStyle.FixedSingle,
-            BackColor = Color.White,
-            Location = new Point(8, 8),
-            Size = new Size(744, 544),
-            Text = text,
+            Text = preview.RenderConfig(),
         };
-        preview.Controls.Add(box);
-        preview.ShowDialog(this);
+        dlg.Controls.Add(box);
+        dlg.ShowDialog(this);
     }
 
-    private void OnImportClick(object? sender, EventArgs e)
+    private void ImportConfig()
     {
-        using var dialog = new OpenFileDialog
-        {
-            Title = "从 cntlm.ini 导入",
-            Filter = "cntlm 配置 (*.ini)|*.ini|所有文件 (*.*)|*.*",
-        };
-
-        var defaultPath = Detect.KnownIniPaths().FirstOrDefault(File.Exists);
-        if (defaultPath != null) dialog.FileName = defaultPath;
-
-        if (dialog.ShowDialog(this) != DialogResult.OK) return;
-
-        try
-        {
-            var imported = CntlmConfigGenerator.Import(dialog.FileName);
-            _settings.ProxyList = imported.ProxyList;
-            LoadValuesFrom(imported);
-            _importStatus.Text = "已导入配置（尚未保存）。";
-            _importStatus.ForeColor = AppTheme.Success;
-        }
-        catch (Exception ex)
-        {
-            MessageBox.Show(this, "导入失败：" + ex.Message, "导入",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
+        using var d = new OpenFileDialog { Filter = "cntlm 配置|cntlm.ini;*.ini" };
+        if (d.ShowDialog() != DialogResult.OK) return;
+        ApplyToControls(CntlmConfigGenerator.Import(d.FileName));
+        _runStatus.Text = "已导入配置（尚未保存）。";
     }
 
-    private void LoadValuesFrom(GuiSettings source)
+    private async void GenerateHash()
     {
-        var (host, portText) = GuiSettings.SplitListen(source.Listen);
-        if (!_listenHost.Items.Contains(host)) _listenHost.Items.Add(host);
-        _listenHost.SelectedItem = host;
-        _listenPort.Text = portText;
-        _gatewayToggle.Checked = source.Gateway;
-        _allowBox.Text = source.AllowList;
-        _denyBox.Text = source.DenyList;
-        _noProxyBox.Text = source.NoProxyList;
-        _socks5Box.Text = source.Socks5Proxy;
-        _socks5UserBox.Text = source.Socks5User;
-        _tunnelBox.Text = source.TunnelList;
-
-        _useProxyToggle.Checked = source.UseProxy;
-        _pacBox.Text = source.PacFile;
-        _headerBox.Text = source.HeaderList;
-        _isaToggle.Checked = source.UseIsaScanner;
-        _isaSizeBox.Text = source.IsaScannerSize.ToString();
-        _isaAgentBox.Text = source.IsaScannerAgentList;
-
-        _usernameBox.Text = source.Username;
-        _domainBox.Text = source.Domain;
-        _workstationBox.Text = source.Workstation;
-
-        if (!string.IsNullOrWhiteSpace(source.Auth))
+        var exe = _s.EffectiveBaseCntlmPath();
+        if (string.IsNullOrWhiteSpace(_username.Text) || _password.Text.Length == 0)
         {
-            if (!_authCombo.Items.Contains(source.Auth)) _authCombo.Items.Add(source.Auth);
-            _authCombo.SelectedItem = source.Auth;
-        }
-        else
-        {
-            _authCombo.SelectedIndex = 0;
-        }
-
-        if (string.IsNullOrWhiteSpace(source.Flags)) _flagsCombo.SelectedIndex = 0;
-        else _flagsCombo.Text = source.Flags;
-
-        _sspiToggle.Checked = source.UseSspi;
-        if (!_sspiTypeCombo.Items.Contains(source.SspiType)) _sspiTypeCombo.Items.Add(source.SspiType);
-        _sspiTypeCombo.SelectedItem = string.IsNullOrWhiteSpace(source.SspiType) ? "NTLM" : source.SspiType;
-
-        _passwordBox.Text = source.Password;
-        _passLMBox.Text = source.PassLM;
-        _passNTBox.Text = source.PassNT;
-        _passNTLMv2Box.Text = source.PassNTLMv2;
-
-        UpdateTier2Visibility();
-    }
-
-    private async void OnGenerateHash(object? sender, EventArgs e)
-    {
-        var user = _usernameBox.Text.Trim();
-        var password = _passwordBox.Text;
-        var domain = _domainBox.Text.Trim();
-
-        if (user.Length == 0 || password.Length == 0)
-        {
-            _hashStatus.ForeColor = AppTheme.Danger;
-            _hashStatus.Text = "请先填写用户名和密码。";
+            _authStatus.Text = "请先填写用户名与密码。";
             return;
         }
-
-        var exe = ResolveExeFromUi();
         if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe))
         {
-            _hashStatus.ForeColor = AppTheme.Danger;
-            _hashStatus.Text = "未找到 cntlm.exe，请在 运行 页指定路径。";
+            _authStatus.Text = "未找到 cntlm.exe，无法生成哈希（可在“运行”页指定）。";
             return;
         }
 
-        _hashStatus.ForeColor = AppTheme.Muted;
-        _hashStatus.Text = "正在生成哈希…";
+        // 密码不放到命令行（进程列表可见），改为从 stdin 交给 cntlm -H
+        var psi = new ProcessStartInfo
+        {
+            FileName = exe,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            WorkingDirectory = Path.GetDirectoryName(exe),
+        };
+        psi.ArgumentList.Add("-H");
+        psi.ArgumentList.Add("-u");
+        psi.ArgumentList.Add(_username.Text.Trim());
+        if (!string.IsNullOrWhiteSpace(_domain.Text.Trim()))
+        {
+            psi.ArgumentList.Add("-d");
+            psi.ArgumentList.Add(_domain.Text.Trim());
+        }
 
         try
         {
-            var arguments = new StringBuilder();
-            arguments.Append("-H -u \"").Append(user).Append('"');
-            if (domain.Length > 0) arguments.Append(" -d \"").Append(domain).Append('"');
-
-            var psi = new ProcessStartInfo(exe, arguments.ToString())
+            using var p = Process.Start(psi);
+            if (p == null)
             {
-                UseShellExecute = false,
-                RedirectStandardInput = true,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                WorkingDirectory = Path.GetDirectoryName(exe) ?? AppContext.BaseDirectory,
-            };
-
-            using var process = new Process { StartInfo = psi };
-            process.Start();
-
-            await process.StandardInput.WriteLineAsync(password);
-            process.StandardInput.Close();
-
-            var stdoutTask = process.StandardOutput.ReadToEndAsync();
-            var stderrTask = process.StandardError.ReadToEndAsync();
-
-            var exited = await Task.Run(() => process.WaitForExit(30000));
-            if (!exited)
-            {
-                try
-                {
-                    process.Kill(true);
-                }
-                catch
-                {
-                    // 忽略
-                }
-
-                _hashStatus.ForeColor = AppTheme.Danger;
-                _hashStatus.Text = "生成哈希超时（30 秒）。";
+                _authStatus.Text = "无法启动 cntlm 生成哈希。";
                 return;
             }
 
-            var output = await stdoutTask + "\n" + await stderrTask;
-            var lm = ParseHash(output, "PassLM");
-            var nt = ParseHash(output, "PassNT");
-            var ntlmv2 = ParseHash(output, "PassNTLMv2");
-
-            if (lm == null && nt == null && ntlmv2 == null)
+            try
             {
-                MessageBox.Show(this, output, "生成哈希", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                _hashStatus.ForeColor = AppTheme.Danger;
-                _hashStatus.Text = "未能解析哈希输出。";
+                await p.StandardInput.WriteLineAsync(_password.Text);
+                p.StandardInput.Close();
+            }
+            catch
+            {
+                // stdin 关闭失败时继续，交给超时逻辑处理
+            }
+
+            var outTask = p.StandardOutput.ReadToEndAsync();
+            var errTask = p.StandardError.ReadToEndAsync();
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            try
+            {
+                await p.WaitForExitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                try { p.Kill(true); } catch { }
+                _authStatus.Text = "生成哈希超时（30 秒），已终止 cntlm 进程。";
                 return;
             }
 
-            if (lm != null) _passLMBox.Text = lm;
-            if (nt != null) _passNTBox.Text = nt;
-            if (ntlmv2 != null) _passNTLMv2Box.Text = ntlmv2;
+            var outText = await outTask + "\n" + await errTask;
+            var lm = HashOf(outText, "PassLM");
+            var nt = HashOf(outText, "PassNT");
+            var v2 = HashOf(outText, "PassNTLMv2");
+            if (lm == null && nt == null && v2 == null)
+            {
+                _authStatus.Text = "未能解析哈希输出：" + outText.Trim();
+                return;
+            }
 
-            _hashStatus.ForeColor = AppTheme.Success;
-            _hashStatus.Text = "哈希已生成（未保存）。";
+            if (lm != null) _passLm.Text = lm;
+            if (nt != null) _passNt.Text = nt;
+            if (v2 != null) _passV2.Text = v2;
+            _authStatus.Text = "哈希已生成（未保存）。";
         }
         catch (Exception ex)
         {
-            _hashStatus.ForeColor = AppTheme.Danger;
-            _hashStatus.Text = "生成哈希失败：" + ex.Message;
+            _authStatus.Text = "生成哈希失败: " + ex.Message;
         }
     }
 
-    private static string? ParseHash(string output, string key)
+    private static string? HashOf(string text, string key)
     {
-        var match = Regex.Match(output, $@"(?im)^\s*{key}\s*[:=]?\s*([0-9A-Fa-f]{{16,}})\s*$");
-        return match.Success ? match.Groups[1].Value : null;
+        foreach (var line in text.Split('\n'))
+        {
+            var t = line.Trim();
+            if (!t.StartsWith(key, StringComparison.OrdinalIgnoreCase)) continue;
+            int i = key.Length;
+            while (i < t.Length && char.IsWhiteSpace(t[i])) i++;
+            var v = (i < t.Length ? t[i..] : "").Trim();
+            int sp = v.IndexOfAny(new[] { ' ', '\t' });
+            return sp > 0 ? v[..sp] : v;
+        }
+        return null;
     }
 
-    private string ResolveExeFromUi()
+    private void OpenSpeedTest()
     {
-        var path = _cntlmPathBox.Text.Trim();
-        if (path.Length > 0 && File.Exists(path)) return path;
-        return _settings.EffectiveBaseCntlmPath();
-    }
-
-    private static TextBox NewText(string value = "", bool multiline = false, int height = 26)
-    {
-        var box = new TextBox
-        {
-            Text = value,
-            Font = AppTheme.Ui,
-            BorderStyle = BorderStyle.FixedSingle,
-            Multiline = multiline,
-        };
-        if (multiline)
-        {
-            box.Height = height;
-            box.ScrollBars = ScrollBars.Vertical;
-        }
-        return box;
-    }
-
-    private static TextBox NewMonoText() => new()
-    {
-        Font = AppTheme.Mono,
-        BorderStyle = BorderStyle.FixedSingle,
-    };
-
-    private static ToggleSwitch NewToggle(string text) => new()
-    {
-        Text = text,
-        Width = FieldWidth,
-    };
-
-    private static ComboBox NewCombo(params string[] items)
-    {
-        var combo = new ComboBox
-        {
-            DropDownStyle = ComboBoxStyle.DropDownList,
-            Font = AppTheme.Ui,
-            FlatStyle = FlatStyle.System,
-            Width = FieldWidth,
-        };
-        combo.Items.AddRange(items);
-        if (items.Length > 0) combo.SelectedIndex = 0;
-        return combo;
-    }
-
-    private static Panel InlineRow(Control main, int mainWidth, params Control[] buttons)
-    {
-        var panel = new Panel { Height = 26, Width = FieldWidth };
-        main.Location = new Point(0, 1);
-        main.Width = mainWidth;
-        panel.Controls.Add(main);
-        var x = mainWidth + 6;
-        foreach (var button in buttons)
-        {
-            button.Location = new Point(x, 0);
-            panel.Controls.Add(button);
-            x += button.Width + 6;
-        }
-        return panel;
-    }
-
-    private sealed class PageBuilder
-    {
-        private const int Left = 16;
-        private readonly Control _page;
-
-        public PageBuilder(Control page, int startY = 12)
-        {
-            _page = page;
-            Y = startY;
-        }
-
-        public int Y { get; private set; }
-
-        public void Gap(int pixels) => Y += pixels;
-
-        public void Section(string title)
-        {
-            _page.Controls.Add(new Label
-            {
-                Text = title,
-                Font = AppTheme.UiTitle,
-                ForeColor = AppTheme.Text,
-                AutoSize = true,
-                Location = new Point(Left, Y),
-            });
-            Y += 28;
-        }
-
-        public T Row<T>(string label, T control, int? width = null) where T : Control
-        {
-            _page.Controls.Add(new Label
-            {
-                Text = label,
-                Font = AppTheme.Ui,
-                ForeColor = AppTheme.Text,
-                Location = new Point(Left, Y + (control.Height > 28 ? 4 : 5)),
-                Size = new Size(AppTheme.LabelCol, 20),
-            });
-            control.Location = new Point(Left + AppTheme.LabelCol, Y);
-            control.Width = width ?? FieldWidth;
-            _page.Controls.Add(control);
-            Y += Math.Max(control.Height, 26) + 10;
-            return control;
-        }
-
-        public void Block(Control control, int indent = 0, int? width = null)
-        {
-            control.Location = new Point(Left + indent, Y);
-            control.Width = width ?? FieldWidth;
-            _page.Controls.Add(control);
-            Y += control.Height + 10;
-        }
-
-        public void Hint(string text, int width = 380, int indent = AppTheme.LabelCol)
-        {
-            var measured = TextRenderer.MeasureText(text, AppTheme.UiSmall,
-                new Size(width, int.MaxValue), TextFormatFlags.WordBreak);
-            _page.Controls.Add(new Label
-            {
-                Text = text,
-                Font = AppTheme.UiSmall,
-                ForeColor = AppTheme.Muted,
-                AutoSize = false,
-                Location = new Point(Left + indent, Y),
-                Size = new Size(width, measured.Height + 4),
-            });
-            Y += measured.Height + 8;
-        }
-
-        public Button Button(string text, EventHandler handler, bool primary = false)
-        {
-            var button = AppTheme.CreateButton(text, primary);
-            button.Location = new Point(Left, Y);
-            button.Click += handler;
-            _page.Controls.Add(button);
-            Y += button.Height + 10;
-            return button;
-        }
+        using var f = new ProxySpeedForm(_s);
+        f.ShowDialog(this);
     }
 }
