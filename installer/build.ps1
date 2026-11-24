@@ -3,14 +3,19 @@
 $ErrorActionPreference = "Stop"
 
 function Find-WixDir {
-    if ($env:WIXTOOLS) { return $env:WIXTOOLS }
     $candidates = @(
+        $env:WIXTOOLS,
+        $env:WIX,
         (Join-Path $env:LOCALAPPDATA "Tauri\WixTools314"),
         "C:\Program Files (x86)\WiX Toolset v3.14",
         "C:\Program Files\WiX Toolset v3.14"
     )
     foreach ($dir in $candidates) {
-        if (Test-Path (Join-Path $dir "candle.exe")) { return $dir }
+        if (-not $dir) { continue }
+        # 正式安装版把工具放在 bin 子目录，绿色版直接放在根目录
+        foreach ($probe in @($dir, (Join-Path $dir "bin"))) {
+            if (Test-Path (Join-Path $probe "candle.exe")) { return $probe }
+        }
     }
     throw "WiX toolset not found. Set WIXTOOLS to the folder containing candle.exe and light.exe."
 }
