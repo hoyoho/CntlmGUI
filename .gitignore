@@ -1,0 +1,15 @@
+# 构建输出
+bin/
+obj/
+build/
+*.user
+*.suo
+
+# IDE
+.vs/
+.idea/
+
+# 系统与临时文件
+Thumbs.db
+Desktop.ini
+*.log
